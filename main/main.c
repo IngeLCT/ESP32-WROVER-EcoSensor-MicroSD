@@ -11,8 +11,8 @@
 static const char *TAG = "EcoSensor";
 
 // Configuración editable desde aquí
-static const char *MDNS_HOSTNAME = "ecosensorwrover";
-static const char *AP_SSID = "EcoSensor-WROVER";
+static const char *MDNS_HOSTNAME = "ecosensor01";
+static const char *AP_SSID = "EcoSensor-01";
 static const char *AP_PASS = "LCT3180940";
 
 static void wifi_event_handler(void *arg,
