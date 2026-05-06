@@ -8,10 +8,7 @@
 #define WIFI_KEY_PASS      "pass"
 #define WIFI_KEY_IP_EN     "ip_en"
 #define WIFI_KEY_STATIC_IP "static_ip"
-#define WIFI_KEY_SUBNET    "subnet"
 #define WIFI_KEY_GATEWAY   "gateway"
-#define WIFI_KEY_DNS1      "dns1"
-#define WIFI_KEY_DNS2      "dns2"
 
 static esp_err_t ensure_nvs_open(nvs_handle_t *h, nvs_open_mode mode) {
     return nvs_open(WIFI_STORE_NS, mode, h);
