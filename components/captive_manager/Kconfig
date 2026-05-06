@@ -1,0 +1,29 @@
+menu "Captive Manager"
+    config CAPTIVE_MANAGER_ENABLE
+        bool "Enable Captive Manager"
+        default y
+
+    config CAPTIVE_MANAGER_AP_SSID
+        string "AP SSID temporal"
+        default "ESP-LOGIN"
+
+    config CAPTIVE_MANAGER_AP_PASS
+        string "AP password temporal (>=8 chars para WPA2)"
+        default "esp32login"
+
+    config CAPTIVE_MANAGER_MAX_SCAN_APS
+        int "Máximo de APs listados en /scan"
+        default 20
+
+    config CAPTIVE_MANAGER_CONN_MAX_ATTEMPTS
+        int "Máx. reintentos conexión con credenciales guardadas"
+        default 5
+
+    config CAPTIVE_MANAGER_CONN_RETRY_DELAY_MS
+        int "Delay (ms) entre reintentos guardados"
+        default 4000
+
+    config CAPTIVE_MANAGER_BOOT_GRACE_MS
+        int "Ventana de gracia tras arranque (ms) antes de volver al Wi-Fi manager"
+        default 180000
+endmenu
