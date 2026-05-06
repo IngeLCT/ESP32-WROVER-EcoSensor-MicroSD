@@ -7,7 +7,6 @@ managed_components/
 *.map
 
 # SDK configuration backups
-sdkconfig
 sdkconfig.old
 
 # Local secrets
