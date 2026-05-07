@@ -308,7 +308,7 @@ static esp_err_t root_get(httpd_req_t *r)
         "<select id=\"ssid\" name=\"ssid\" required><option value=\"\" disabled selected>Cargando redes...</option></select>"
         "<label for=\"pass\">Contraseña</label>"
         "<input type=\"password\" id=\"pass\" name=\"pass\">"
-        "<div class=\"row-check\"><input type=\"checkbox\" id=\"use_static_ip\" name=\"use_static_ip\"><label for=\"use_static_ip\">Configurar IP manual</label></div>"
+        "<div class=\"row-check\"><input type=\"checkbox\" id=\"use_static_ip\" name=\"use_static_ip\"><label for=\"use_static_ip\">Configurar IP manual</label><span style=\"font-size:12px;color:#555\">Si al conectar la red, el servidor no puede establecer conexion con el pruebe configurando una IP fija.</span></div>"
         "<div class=\"ip-grid\">"
         "<div><label for=\"static_ip\">IP</label><input type=\"text\" id=\"static_ip\" name=\"static_ip\" placeholder=\"192.168.1.50\" disabled></div>"
         "<div><label for=\"gateway\">Gateway</label><input type=\"text\" id=\"gateway\" name=\"gateway\" placeholder=\"192.168.1.1\" disabled></div>"
