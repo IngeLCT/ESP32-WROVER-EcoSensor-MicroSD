@@ -7,13 +7,18 @@
 #include "freertos/task.h"
 
 #include "captive_manager.h"
+#include "sensors.h"
 
 static const char *TAG = "EcoSensor";
 
-// Configuración editable desde aquí
 static const char *MDNS_HOSTNAME = "ecosensor01";
 static const char *AP_SSID = "EcoSensor-01";
 static const char *AP_PASS = "LCT3180940";
+
+#define LOG_EACH_SAMPLE          1
+#define SENSOR_TASK_STACK        8192
+#define SAMPLE_DELAY_MS          5000
+#define SAMPLES_PER_AVG_WINDOW   12
 
 static void wifi_event_handler(void *arg,
                                esp_event_base_t base,
@@ -24,6 +29,122 @@ static void wifi_event_handler(void *arg,
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)data;
         captive_manager_notify_sta_disconnected(disc ? disc->reason : -1);
+    }
+}
+
+static void sensor_task(void *pv) {
+    const TickType_t sample_delay_ticks = pdMS_TO_TICKS(SAMPLE_DELAY_MS);
+
+    int sample_slot = 0;
+    uint32_t sum_co2 = 0;
+    int scd40_ok_count = 0;
+    int sen55_ok_count = 0;
+
+    double sum_pm1p0 = 0;
+    double sum_pm2p5 = 0;
+    double sum_pm4p0 = 0;
+    double sum_pm10p0 = 0;
+    double sum_voc = 0;
+    double sum_nox = 0;
+    double sum_scd_temp = 0;
+    double sum_scd_hum = 0;
+    double sum_sen_temp = 0;
+    double sum_sen_hum = 0;
+    double sum_avg_temp = 0;
+    double sum_avg_hum = 0;
+
+    while (1) {
+        SensorData data = {0};
+
+        esp_err_t scd_ret = sensors_read_scd40(&data);
+        int scd_diag = sensors_get_last_scd40_diag();
+        if (scd_ret == ESP_OK) {
+            sum_co2 += data.co2;
+            sum_scd_temp += data.scd_temp;
+            sum_scd_hum += data.scd_hum;
+            scd40_ok_count++;
+        }
+
+        esp_err_t sen_ret = sensors_read_sen55(&data);
+        int sen_diag = sensors_get_last_sen55_diag();
+        if (sen_ret == ESP_OK) {
+            sum_pm1p0 += data.pm1p0;
+            sum_pm2p5 += data.pm2p5;
+            sum_pm4p0 += data.pm4p0;
+            sum_pm10p0 += data.pm10p0;
+            sum_voc += data.voc;
+            sum_nox += data.nox;
+            sum_sen_temp += data.sen_temp;
+            sum_sen_hum += data.sen_hum;
+            sum_avg_temp += data.avg_temp;
+            sum_avg_hum += data.avg_hum;
+            sen55_ok_count++;
+        }
+
+#if LOG_EACH_SAMPLE
+        ESP_LOGI(TAG,
+                 "Muestra %d/%d | SCD40 co2=%u diag=%02d ret=%s | SEN55 pm2.5=%.2f temp=%.2f hum=%.2f diag=%02d ret=%s",
+                 sample_slot + 1,
+                 SAMPLES_PER_AVG_WINDOW,
+                 data.co2,
+                 scd_diag,
+                 esp_err_to_name(scd_ret),
+                 data.pm2p5,
+                 data.avg_temp,
+                 data.avg_hum,
+                 sen_diag,
+                 esp_err_to_name(sen_ret));
+#endif
+
+        sample_slot++;
+
+        if (sample_slot >= SAMPLES_PER_AVG_WINDOW) {
+            SensorData window_avg = {0};
+
+            if (scd40_ok_count > 0) {
+                double denom = (double)scd40_ok_count;
+                window_avg.co2 = (uint16_t)(sum_co2 / scd40_ok_count);
+                window_avg.scd_temp = (float)(sum_scd_temp / denom);
+                window_avg.scd_hum = (float)(sum_scd_hum / denom);
+            }
+
+            if (sen55_ok_count > 0) {
+                double denom = (double)sen55_ok_count;
+                window_avg.pm1p0 = (float)(sum_pm1p0 / denom);
+                window_avg.pm2p5 = (float)(sum_pm2p5 / denom);
+                window_avg.pm4p0 = (float)(sum_pm4p0 / denom);
+                window_avg.pm10p0 = (float)(sum_pm10p0 / denom);
+                window_avg.voc = (float)(sum_voc / denom);
+                window_avg.nox = (float)(sum_nox / denom);
+                window_avg.sen_temp = (float)(sum_sen_temp / denom);
+                window_avg.sen_hum = (float)(sum_sen_hum / denom);
+                window_avg.avg_temp = (float)(sum_avg_temp / denom);
+                window_avg.avg_hum = (float)(sum_avg_hum / denom);
+            }
+
+            char json[320];
+            sensors_format_json(&window_avg, json, sizeof(json));
+            ESP_LOGI(TAG, "Promedio 5 min: %s", json);
+
+            sample_slot = 0;
+            sum_co2 = 0;
+            scd40_ok_count = 0;
+            sen55_ok_count = 0;
+            sum_pm1p0 = 0;
+            sum_pm2p5 = 0;
+            sum_pm4p0 = 0;
+            sum_pm10p0 = 0;
+            sum_voc = 0;
+            sum_nox = 0;
+            sum_scd_temp = 0;
+            sum_scd_hum = 0;
+            sum_sen_temp = 0;
+            sum_sen_hum = 0;
+            sum_avg_temp = 0;
+            sum_avg_hum = 0;
+        }
+
+        vTaskDelay(sample_delay_ticks);
     }
 }
 
@@ -47,6 +168,13 @@ void app_main(void)
     ESP_LOGI(TAG, "WiFi manager iniciado");
     ESP_LOGI(TAG, "mDNS: %s.local", MDNS_HOSTNAME);
     ESP_LOGI(TAG, "AP temporal: SSID=%s", AP_SSID);
+
+    esp_err_t sret = sensors_init_all();
+    if (sret != ESP_OK) {
+        ESP_LOGE(TAG, "Fallo al inicializar sensores: %s", esp_err_to_name(sret));
+    } else {
+        xTaskCreate(sensor_task, "sensor_task", SENSOR_TASK_STACK, NULL, 5, NULL);
+    }
 
     while (1) {
         ESP_LOGI(TAG, "Estado captive_manager: %s",
