@@ -27,6 +27,21 @@ typedef struct {
     const char *mdns_hostname;
 } captive_manager_cfg_t;
 
+typedef struct {
+    bool valid;
+    uint32_t window_s;
+    char timestamp[32];
+    uint16_t co2;
+    float pm1p0;
+    float pm2p5;
+    float pm4p0;
+    float pm10p0;
+    float voc;
+    float nox;
+    float temp;
+    float hum;
+} captive_manager_readings_t;
+
 esp_err_t captive_manager_init(const captive_manager_cfg_t *cfg);
 esp_err_t captive_manager_start(void);
 
@@ -38,6 +53,8 @@ void captive_manager_notify_sta_disconnected(int reason_code);
 
 esp_err_t captive_manager_enter_recaptive(void);
 bool captive_manager_using_saved(void);
+void captive_manager_set_sensors_started(bool started);
+void captive_manager_set_last_readings(const captive_manager_readings_t *readings);
 
 #ifdef __cplusplus
 }

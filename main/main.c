@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <time.h>
 
 #include "esp_event.h"
 #include "esp_log.h"
@@ -35,6 +36,40 @@ static void wifi_event_handler(void *arg,
 
 static TaskHandle_t s_sensor_task_handle = NULL;
 static bool s_sensors_started = false;
+
+static bool system_time_is_valid(void) {
+    time_t now = 0;
+    time(&now);
+    return now >= 1735689600;
+}
+
+static void publish_latest_average(const SensorData *avg) {
+    if (!avg) {
+        return;
+    }
+
+    captive_manager_readings_t snapshot = {0};
+    snapshot.valid = true;
+    snapshot.window_s = (SAMPLE_DELAY_MS * SAMPLES_PER_AVG_WINDOW) / 1000;
+    snapshot.co2 = avg->co2;
+    snapshot.pm1p0 = avg->pm1p0;
+    snapshot.pm2p5 = avg->pm2p5;
+    snapshot.pm4p0 = avg->pm4p0;
+    snapshot.pm10p0 = avg->pm10p0;
+    snapshot.voc = avg->voc;
+    snapshot.nox = avg->nox;
+    snapshot.temp = avg->avg_temp;
+    snapshot.hum = avg->avg_hum;
+
+    if (system_time_is_valid()) {
+        time_t now = time(NULL);
+        struct tm utc_tm = {0};
+        gmtime_r(&now, &utc_tm);
+        strftime(snapshot.timestamp, sizeof(snapshot.timestamp), "%Y-%m-%dT%H:%M:%SZ", &utc_tm);
+    }
+
+    captive_manager_set_last_readings(&snapshot);
+}
 
 static void sensor_task(void *pv) {
     const TickType_t sample_delay_ticks = pdMS_TO_TICKS(SAMPLE_DELAY_MS);
@@ -128,6 +163,7 @@ static void sensor_task(void *pv) {
 
             char json[320];
             sensors_format_json(&window_avg, json, sizeof(json));
+            publish_latest_average(&window_avg);
             ESP_LOGI(TAG, "Promedio 1 min: %s", json);
 
             sample_slot = 0;
@@ -167,6 +203,7 @@ static void sensor_start_task(void *pv) {
 
             xTaskCreate(sensor_task, "sensor_task", SENSOR_TASK_STACK, NULL, 5, &s_sensor_task_handle);
             s_sensors_started = true;
+            captive_manager_set_sensors_started(true);
             ESP_LOGI(TAG, "Sensores y promedio iniciados despues de la configuracion WiFi");
             vTaskDelete(NULL);
             return;
@@ -193,6 +230,7 @@ void app_main(void)
     ESP_ERROR_CHECK(captive_manager_init(&cfg));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &wifi_event_handler, NULL));
+    captive_manager_set_sensors_started(false);
     ESP_ERROR_CHECK(captive_manager_start());
 
     ESP_LOGI(TAG, "WiFi manager iniciado");

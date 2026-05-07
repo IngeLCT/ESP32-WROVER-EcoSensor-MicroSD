@@ -16,6 +16,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 
 static const char *TAG = "wifi_manager";
 
@@ -27,8 +28,10 @@ static esp_netif_t *g_sta_netif = NULL;
 
 static bool g_sta_have_ip = false;
 static bool g_using_saved = false;
+static bool g_sensors_started = false;
 static int  g_connect_attempts = 0;
 static int64_t g_boot_time_ms = 0;
+static captive_manager_readings_t g_last_readings = {0};
 
 static void restart_later_task(void *arg) {
     vTaskDelay(pdMS_TO_TICKS(800));
@@ -46,6 +49,8 @@ static bool in_boot_grace_window(void);
 static void start_with_saved_or_manager(void);
 static esp_err_t parse_ipv4_or_fail(const char *text, esp_ip4_addr_t *out);
 static esp_err_t apply_saved_sta_ip_config(void);
+static bool system_time_is_valid(void);
+static void get_active_ip_string(char *buf, size_t buf_size);
 
 const char* captive_manager_state_str(captive_state_t st) {
     switch(st){
@@ -74,6 +79,18 @@ static void set_state(captive_state_t st) {
 
 bool captive_manager_using_saved(void) {
     return g_using_saved;
+}
+
+void captive_manager_set_sensors_started(bool started) {
+    g_sensors_started = started;
+}
+
+void captive_manager_set_last_readings(const captive_manager_readings_t *readings) {
+    if (!readings) {
+        memset(&g_last_readings, 0, sizeof(g_last_readings));
+        return;
+    }
+    g_last_readings = *readings;
 }
 
 esp_err_t captive_manager_init(const captive_manager_cfg_t *cfg) {
@@ -478,11 +495,64 @@ static esp_err_t scan_get(httpd_req_t *r) {
 }
 
 static esp_err_t status_get(httpd_req_t *r) {
+    const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
+    char mdns_name[64];
+    char ip_buf[32];
+    snprintf(mdns_name, sizeof(mdns_name), "%s.local", device_id);
+    get_active_ip_string(ip_buf, sizeof(ip_buf));
+
+    const char *wifi = "ap_mode";
+    if (g_sta_have_ip) {
+        wifi = "connected";
+    } else if (g_state == CAP_STATE_CONNECTING || g_state == CAP_STATE_VERIFY || g_state == CAP_STATE_WAIT_LOGIN) {
+        wifi = "connecting";
+    }
+
     cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "device_id", device_id);
+    cJSON_AddStringToObject(root, "wifi", wifi);
+    cJSON_AddStringToObject(root, "ip", ip_buf);
+    cJSON_AddStringToObject(root, "mdns", mdns_name);
+    cJSON_AddBoolToObject(root, "time_valid", system_time_is_valid());
+    cJSON_AddStringToObject(root, "sensors", g_sensors_started ? "running" : "waiting");
     cJSON_AddStringToObject(root, "state", captive_manager_state_str(g_state));
-    cJSON_AddBoolToObject(root, "sta_ip", g_sta_have_ip);
     cJSON_AddBoolToObject(root, "using_saved", g_using_saved);
     cJSON_AddNumberToObject(root, "conn_attempts", g_connect_attempts);
+    char *out = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_sendstr(r, out);
+    free(out);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t lecturas_get(httpd_req_t *r) {
+    const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "device_id", device_id);
+    cJSON_AddBoolToObject(root, "valid", g_last_readings.valid);
+    cJSON_AddNumberToObject(root, "window_s", g_last_readings.window_s);
+
+    if (!g_last_readings.valid) {
+        cJSON_AddBoolToObject(root, "time_valid", system_time_is_valid());
+        cJSON_AddStringToObject(root, "message", "Sin lecturas promediadas disponibles");
+    } else {
+        if (g_last_readings.timestamp[0]) {
+            cJSON_AddStringToObject(root, "timestamp", g_last_readings.timestamp);
+        } else {
+            cJSON_AddNullToObject(root, "timestamp");
+        }
+        cJSON_AddNumberToObject(root, "co2", g_last_readings.co2);
+        cJSON_AddNumberToObject(root, "pm1p0", g_last_readings.pm1p0);
+        cJSON_AddNumberToObject(root, "pm2p5", g_last_readings.pm2p5);
+        cJSON_AddNumberToObject(root, "pm4p0", g_last_readings.pm4p0);
+        cJSON_AddNumberToObject(root, "pm10p0", g_last_readings.pm10p0);
+        cJSON_AddNumberToObject(root, "voc", g_last_readings.voc);
+        cJSON_AddNumberToObject(root, "nox", g_last_readings.nox);
+        cJSON_AddNumberToObject(root, "temp", g_last_readings.temp);
+        cJSON_AddNumberToObject(root, "hum", g_last_readings.hum);
+    }
+
     char *out = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(r, "application/json");
     httpd_resp_sendstr(r, out);
@@ -508,6 +578,7 @@ static httpd_uri_t uri_root             = { .uri="/",            .method=HTTP_GE
 static httpd_uri_t uri_scan             = { .uri="/scan",        .method=HTTP_GET,    .handler=scan_get };
 static httpd_uri_t uri_save             = { .uri="/save",        .method=HTTP_POST,   .handler=save_post };
 static httpd_uri_t uri_status           = { .uri="/status",      .method=HTTP_GET,    .handler=status_get };
+static httpd_uri_t uri_lecturas         = { .uri="/lecturas",    .method=HTTP_GET,    .handler=lecturas_get };
 static httpd_uri_t uri_wifi_clr         = { .uri="/wifi/clear",  .method=HTTP_DELETE, .handler=wifi_clear_delete };
 static httpd_uri_t uri_wifi_clr_get     = { .uri="/wifi/clear",  .method=HTTP_GET,    .handler=wifi_clear_get };
 
@@ -525,6 +596,7 @@ static esp_err_t start_http(void) {
         httpd_register_uri_handler(g_server, &uri_scan);
         httpd_register_uri_handler(g_server, &uri_save);
         httpd_register_uri_handler(g_server, &uri_status);
+        httpd_register_uri_handler(g_server, &uri_lecturas);
         httpd_register_uri_handler(g_server, &uri_wifi_clr);
         httpd_register_uri_handler(g_server, &uri_wifi_clr_get);
         return ESP_OK;
@@ -534,10 +606,6 @@ static esp_err_t start_http(void) {
 }
 
 static void shutdown_ap_http(void) {
-    if (g_server) {
-        httpd_stop(g_server);
-        g_server = NULL;
-    }
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_mode(WIFI_MODE_STA));
 }
 
@@ -554,5 +622,34 @@ static void start_mdns_service(void) {
         ESP_LOGI(TAG, "mDNS started as %s.local", hostname);
     } else {
         ESP_LOGW(TAG, "mDNS init failed");
+    }
+}
+
+static bool system_time_is_valid(void) {
+    time_t now = 0;
+    time(&now);
+    return now >= 1735689600;
+}
+
+static void get_active_ip_string(char *buf, size_t buf_size) {
+    if (!buf || buf_size == 0) {
+        return;
+    }
+
+    buf[0] = '\0';
+    esp_netif_ip_info_t ip_info = {0};
+    esp_err_t err = ESP_FAIL;
+
+    if (g_sta_have_ip && g_sta_netif) {
+        err = esp_netif_get_ip_info(g_sta_netif, &ip_info);
+    } else if (g_ap_netif) {
+        err = esp_netif_get_ip_info(g_ap_netif, &ip_info);
+    }
+
+    if (err == ESP_OK) {
+        snprintf(buf,
+                 buf_size,
+                 IPSTR,
+                 IP2STR(&ip_info.ip));
     }
 }
