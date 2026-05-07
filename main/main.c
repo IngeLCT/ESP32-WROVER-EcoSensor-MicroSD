@@ -17,6 +17,7 @@ static const char *AP_PASS = "LCT3180940";
 
 #define LOG_EACH_SAMPLE          1
 #define SENSOR_TASK_STACK        8192
+#define SENSOR_START_TASK_STACK  4096
 #define SAMPLE_DELAY_MS          5000
 #define SAMPLES_PER_AVG_WINDOW   12
 
@@ -31,6 +32,9 @@ static void wifi_event_handler(void *arg,
         captive_manager_notify_sta_disconnected(disc ? disc->reason : -1);
     }
 }
+
+static TaskHandle_t s_sensor_task_handle = NULL;
+static bool s_sensors_started = false;
 
 static void sensor_task(void *pv) {
     const TickType_t sample_delay_ticks = pdMS_TO_TICKS(SAMPLE_DELAY_MS);
@@ -124,7 +128,7 @@ static void sensor_task(void *pv) {
 
             char json[320];
             sensors_format_json(&window_avg, json, sizeof(json));
-            ESP_LOGI(TAG, "Promedio 5 min: %s", json);
+            ESP_LOGI(TAG, "Promedio 1 min: %s", json);
 
             sample_slot = 0;
             sum_co2 = 0;
@@ -145,6 +149,32 @@ static void sensor_task(void *pv) {
         }
 
         vTaskDelay(sample_delay_ticks);
+    }
+}
+
+static void sensor_start_task(void *pv) {
+    while (1) {
+        captive_state_t st = captive_manager_get_state();
+        if (st == CAP_STATE_OPERATIONAL) {
+            ESP_LOGI(TAG, "WiFi configurado y operativo; iniciando sensores");
+
+            esp_err_t sret = sensors_init_all();
+            if (sret != ESP_OK) {
+                ESP_LOGE(TAG, "Fallo al inicializar sensores: %s", esp_err_to_name(sret));
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                continue;
+            }
+
+            xTaskCreate(sensor_task, "sensor_task", SENSOR_TASK_STACK, NULL, 5, &s_sensor_task_handle);
+            s_sensors_started = true;
+            ESP_LOGI(TAG, "Sensores y promedio iniciados despues de la configuracion WiFi");
+            vTaskDelete(NULL);
+            return;
+        }
+
+        ESP_LOGI(TAG, "Esperando configuracion WiFi para iniciar sensores... estado=%s",
+                 captive_manager_state_str(st));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -169,16 +199,17 @@ void app_main(void)
     ESP_LOGI(TAG, "mDNS: %s.local", MDNS_HOSTNAME);
     ESP_LOGI(TAG, "AP temporal: SSID=%s", AP_SSID);
 
-    esp_err_t sret = sensors_init_all();
-    if (sret != ESP_OK) {
-        ESP_LOGE(TAG, "Fallo al inicializar sensores: %s", esp_err_to_name(sret));
-    } else {
-        xTaskCreate(sensor_task, "sensor_task", SENSOR_TASK_STACK, NULL, 5, NULL);
-    }
+    xTaskCreate(sensor_start_task,
+                "sensor_start_task",
+                SENSOR_START_TASK_STACK,
+                NULL,
+                5,
+                NULL);
 
     while (1) {
-        ESP_LOGI(TAG, "Estado captive_manager: %s",
-                 captive_manager_state_str(captive_manager_get_state()));
+        ESP_LOGI(TAG, "Estado captive_manager: %s | sensores=%s",
+                 captive_manager_state_str(captive_manager_get_state()),
+                 s_sensors_started ? "iniciados" : "esperando wifi");
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
