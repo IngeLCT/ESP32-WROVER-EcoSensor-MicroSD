@@ -234,8 +234,12 @@ void captive_manager_notify_sta_got_ip(void) {
     g_sta_have_ip = true;
     g_connect_attempts = 0;
     shutdown_ap_http();
+    esp_err_t http_err = start_http();
+    if (http_err != ESP_OK) {
+        ESP_LOGE(TAG, "No se pudo iniciar HTTP en STA: %s", esp_err_to_name(http_err));
+    }
     set_state(CAP_STATE_OPERATIONAL);
-    ESP_LOGI(TAG, "STA connected and operational");
+    ESP_LOGI(TAG, "STA connected and operational; HTTP endpoints available on port 80");
 }
 
 void captive_manager_notify_sta_disconnected(int reason_code) {
