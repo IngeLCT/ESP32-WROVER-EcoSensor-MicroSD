@@ -9,6 +9,9 @@
 #define WIFI_KEY_IP_EN     "ip_en"
 #define WIFI_KEY_STATIC_IP "static_ip"
 #define WIFI_KEY_GATEWAY   "gateway"
+#define WIFI_KEY_TIME_EN   "time_en"
+#define WIFI_KEY_DATE      "date"
+#define WIFI_KEY_TIME      "time"
 
 static esp_err_t ensure_nvs_open(nvs_handle_t *h, nvs_open_mode mode) {
     return nvs_open(WIFI_STORE_NS, mode, h);
@@ -131,6 +134,60 @@ esp_err_t wifi_store_load_static_ip_cfg(wifi_static_ip_cfg_t *cfg) {
     return ESP_OK;
 }
 
+esp_err_t wifi_store_save_device_time(const device_time_cfg_t *cfg) {
+    if (!cfg) return ESP_ERR_INVALID_ARG;
+
+    nvs_handle_t h;
+    esp_err_t err = ensure_nvs_open(&h, NVS_READWRITE);
+    if (err != ESP_OK) return err;
+
+    ESP_ERROR_CHECK(nvs_set_u8(h, WIFI_KEY_TIME_EN, cfg->valid ? 1 : 0));
+    if (cfg->valid) {
+        ESP_ERROR_CHECK(nvs_set_str(h, WIFI_KEY_DATE, cfg->date));
+        ESP_ERROR_CHECK(nvs_set_str(h, WIFI_KEY_TIME, cfg->time));
+    } else {
+        nvs_erase_key(h, WIFI_KEY_DATE);
+        nvs_erase_key(h, WIFI_KEY_TIME);
+    }
+
+    err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+esp_err_t wifi_store_load_device_time(device_time_cfg_t *cfg) {
+    if (!cfg) return ESP_ERR_INVALID_ARG;
+    memset(cfg, 0, sizeof(*cfg));
+
+    nvs_handle_t h;
+    esp_err_t err = ensure_nvs_open(&h, NVS_READONLY);
+    if (err != ESP_OK) return err;
+
+    uint8_t enabled = 0;
+    err = nvs_get_u8(h, WIFI_KEY_TIME_EN, &enabled);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        cfg->valid = false;
+        nvs_close(h);
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        nvs_close(h);
+        return err;
+    }
+
+    cfg->valid = enabled != 0;
+    if (cfg->valid) {
+        if ((err = load_str_or_empty(h, WIFI_KEY_DATE, cfg->date, sizeof(cfg->date))) != ESP_OK ||
+            (err = load_str_or_empty(h, WIFI_KEY_TIME, cfg->time, sizeof(cfg->time))) != ESP_OK) {
+            nvs_close(h);
+            return err;
+        }
+    }
+
+    nvs_close(h);
+    return ESP_OK;
+}
+
 esp_err_t wifi_store_clear(void) {
     nvs_handle_t h;
     esp_err_t err = ensure_nvs_open(&h, NVS_READWRITE);
@@ -141,6 +198,9 @@ esp_err_t wifi_store_clear(void) {
     nvs_erase_key(h, WIFI_KEY_IP_EN);
     nvs_erase_key(h, WIFI_KEY_STATIC_IP);
     nvs_erase_key(h, WIFI_KEY_GATEWAY);
+    nvs_erase_key(h, WIFI_KEY_TIME_EN);
+    nvs_erase_key(h, WIFI_KEY_DATE);
+    nvs_erase_key(h, WIFI_KEY_TIME);
     err = nvs_commit(h);
     nvs_close(h);
     return err;

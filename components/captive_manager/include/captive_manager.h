@@ -55,6 +55,7 @@ esp_err_t captive_manager_enter_recaptive(void);
 bool captive_manager_using_saved(void);
 void captive_manager_set_sensors_started(bool started);
 void captive_manager_set_last_readings(const captive_manager_readings_t *readings);
+bool captive_manager_time_is_valid(void);
 
 #ifdef __cplusplus
 }

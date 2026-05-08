@@ -37,12 +37,6 @@ static void wifi_event_handler(void *arg,
 static TaskHandle_t s_sensor_task_handle = NULL;
 static bool s_sensors_started = false;
 
-static bool system_time_is_valid(void) {
-    time_t now = 0;
-    time(&now);
-    return now >= 1735689600;
-}
-
 static void publish_latest_average(const SensorData *avg) {
     if (!avg) {
         return;
@@ -61,7 +55,7 @@ static void publish_latest_average(const SensorData *avg) {
     snapshot.temp = avg->avg_temp;
     snapshot.hum = avg->avg_hum;
 
-    if (system_time_is_valid()) {
+    if (captive_manager_time_is_valid()) {
         time_t now = time(NULL);
         struct tm utc_tm = {0};
         gmtime_r(&now, &utc_tm);
@@ -191,8 +185,14 @@ static void sensor_task(void *pv) {
 static void sensor_start_task(void *pv) {
     while (1) {
         captive_state_t st = captive_manager_get_state();
+        if (st == CAP_STATE_OPERATIONAL && !captive_manager_time_is_valid()) {
+            ESP_LOGI(TAG, "WiFi operativo; esperando configuracion de fecha/hora via POST /config");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
         if (st == CAP_STATE_OPERATIONAL) {
-            ESP_LOGI(TAG, "WiFi configurado y operativo; iniciando sensores");
+            ESP_LOGI(TAG, "WiFi, fecha y hora configurados; iniciando sensores");
 
             esp_err_t sret = sensors_init_all();
             if (sret != ESP_OK) {
@@ -209,8 +209,9 @@ static void sensor_start_task(void *pv) {
             return;
         }
 
-        ESP_LOGI(TAG, "Esperando configuracion WiFi para iniciar sensores... estado=%s",
-                 captive_manager_state_str(st));
+        ESP_LOGI(TAG, "Esperando WiFi y fecha/hora para iniciar sensores... estado=%s time_valid=%s",
+                 captive_manager_state_str(st),
+                 captive_manager_time_is_valid() ? "true" : "false");
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -245,9 +246,10 @@ void app_main(void)
                 NULL);
 
     while (1) {
-        ESP_LOGI(TAG, "Estado captive_manager: %s | sensores=%s",
+        ESP_LOGI(TAG, "Estado captive_manager: %s | time_valid=%s | sensores=%s",
                  captive_manager_state_str(captive_manager_get_state()),
-                 s_sensors_started ? "iniciados" : "esperando wifi");
+                 captive_manager_time_is_valid() ? "true" : "false",
+                 s_sensors_started ? "iniciados" : "esperando");
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }

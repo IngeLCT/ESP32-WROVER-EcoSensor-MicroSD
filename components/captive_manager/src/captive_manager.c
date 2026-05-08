@@ -17,6 +17,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <ctype.h>
+#include <sys/time.h>
 
 static const char *TAG = "wifi_manager";
 
@@ -29,6 +31,9 @@ static esp_netif_t *g_sta_netif = NULL;
 static bool g_sta_have_ip = false;
 static bool g_using_saved = false;
 static bool g_sensors_started = false;
+static bool g_time_valid = false;
+static char g_config_date[11] = {0};
+static char g_config_time[9] = {0};
 static int  g_connect_attempts = 0;
 static int64_t g_boot_time_ms = 0;
 static captive_manager_readings_t g_last_readings = {0};
@@ -49,7 +54,9 @@ static bool in_boot_grace_window(void);
 static void start_with_saved_or_manager(void);
 static esp_err_t parse_ipv4_or_fail(const char *text, esp_ip4_addr_t *out);
 static esp_err_t apply_saved_sta_ip_config(void);
-static bool system_time_is_valid(void);
+static bool validate_date_time(const char *date, const char *time_text);
+static esp_err_t apply_device_time(const char *date, const char *time_text);
+static void load_saved_device_time(void);
 static void get_active_ip_string(char *buf, size_t buf_size);
 
 const char* captive_manager_state_str(captive_state_t st) {
@@ -93,6 +100,83 @@ void captive_manager_set_last_readings(const captive_manager_readings_t *reading
     g_last_readings = *readings;
 }
 
+bool captive_manager_time_is_valid(void) {
+    return g_time_valid;
+}
+
+static bool validate_date_time(const char *date, const char *time_text) {
+    if (!date || !time_text || strlen(date) != 10 || strlen(time_text) != 8) return false;
+    if (date[2] != '-' || date[5] != '-' || time_text[2] != ':' || time_text[5] != ':') return false;
+    for (int i = 0; i < 10; i++) {
+        if (i == 2 || i == 5) continue;
+        if (!isdigit((unsigned char)date[i])) return false;
+    }
+    for (int i = 0; i < 8; i++) {
+        if (i == 2 || i == 5) continue;
+        if (!isdigit((unsigned char)time_text[i])) return false;
+    }
+
+    int day = (date[0] - '0') * 10 + (date[1] - '0');
+    int month = (date[3] - '0') * 10 + (date[4] - '0');
+    int year = (date[6] - '0') * 1000 + (date[7] - '0') * 100 + (date[8] - '0') * 10 + (date[9] - '0');
+    int hour = (time_text[0] - '0') * 10 + (time_text[1] - '0');
+    int minute = (time_text[3] - '0') * 10 + (time_text[4] - '0');
+    int second = (time_text[6] - '0') * 10 + (time_text[7] - '0');
+
+    if (year < 2024 || month < 1 || month > 12 || day < 1 || day > 31) return false;
+    if (hour > 23 || minute > 59 || second > 59) return false;
+
+    static const int days_in_month[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+    int max_day = days_in_month[month];
+    bool leap = ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0));
+    if (month == 2 && leap) max_day = 29;
+    return day <= max_day;
+}
+
+static esp_err_t apply_device_time(const char *date, const char *time_text) {
+    if (!validate_date_time(date, time_text)) return ESP_ERR_INVALID_ARG;
+
+    struct tm tm_value = {0};
+    tm_value.tm_mday = (date[0] - '0') * 10 + (date[1] - '0');
+    tm_value.tm_mon = ((date[3] - '0') * 10 + (date[4] - '0')) - 1;
+    tm_value.tm_year = ((date[6] - '0') * 1000 + (date[7] - '0') * 100 + (date[8] - '0') * 10 + (date[9] - '0')) - 1900;
+    tm_value.tm_hour = (time_text[0] - '0') * 10 + (time_text[1] - '0');
+    tm_value.tm_min = (time_text[3] - '0') * 10 + (time_text[4] - '0');
+    tm_value.tm_sec = (time_text[6] - '0') * 10 + (time_text[7] - '0');
+    tm_value.tm_isdst = -1;
+
+    time_t epoch = mktime(&tm_value);
+    if (epoch < 0) return ESP_ERR_INVALID_ARG;
+
+    struct timeval now = { .tv_sec = epoch, .tv_usec = 0 };
+    if (settimeofday(&now, NULL) != 0) return ESP_FAIL;
+
+    snprintf(g_config_date, sizeof(g_config_date), "%s", date);
+    snprintf(g_config_time, sizeof(g_config_time), "%s", time_text);
+    g_time_valid = true;
+
+    device_time_cfg_t cfg = {0};
+    cfg.valid = true;
+    snprintf(cfg.date, sizeof(cfg.date), "%s", date);
+    snprintf(cfg.time, sizeof(cfg.time), "%s", time_text);
+    return wifi_store_save_device_time(&cfg);
+}
+
+static void load_saved_device_time(void) {
+    device_time_cfg_t cfg = {0};
+    esp_err_t err = wifi_store_load_device_time(&cfg);
+    if (err == ESP_OK && cfg.valid && validate_date_time(cfg.date, cfg.time)) {
+        if (apply_device_time(cfg.date, cfg.time) == ESP_OK) {
+            ESP_LOGI(TAG, "Fecha/hora cargada desde NVS: %s %s", cfg.date, cfg.time);
+            return;
+        }
+    }
+    g_time_valid = false;
+    g_config_date[0] = 0;
+    g_config_time[0] = 0;
+    ESP_LOGI(TAG, "Fecha/hora no configurada; sensores en espera hasta POST /config");
+}
+
 esp_err_t captive_manager_init(const captive_manager_cfg_t *cfg) {
     if (!cfg) return ESP_ERR_INVALID_ARG;
     g_cfg = *cfg;
@@ -102,6 +186,8 @@ esp_err_t captive_manager_init(const captive_manager_cfg_t *cfg) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
+
+    load_saved_device_time();
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -517,7 +603,11 @@ static esp_err_t status_get(httpd_req_t *r) {
     cJSON_AddStringToObject(root, "wifi", wifi);
     cJSON_AddStringToObject(root, "ip", ip_buf);
     cJSON_AddStringToObject(root, "mdns", mdns_name);
-    cJSON_AddBoolToObject(root, "time_valid", system_time_is_valid());
+    cJSON_AddBoolToObject(root, "time_valid", g_time_valid);
+    if (g_time_valid) {
+        cJSON_AddStringToObject(root, "date", g_config_date);
+        cJSON_AddStringToObject(root, "time", g_config_time);
+    }
     cJSON_AddStringToObject(root, "sensors", g_sensors_started ? "running" : "waiting");
     cJSON_AddStringToObject(root, "state", captive_manager_state_str(g_state));
     cJSON_AddBoolToObject(root, "using_saved", g_using_saved);
@@ -538,7 +628,7 @@ static esp_err_t lecturas_get(httpd_req_t *r) {
     cJSON_AddNumberToObject(root, "window_s", g_last_readings.window_s);
 
     if (!g_last_readings.valid) {
-        cJSON_AddBoolToObject(root, "time_valid", system_time_is_valid());
+        cJSON_AddBoolToObject(root, "time_valid", g_time_valid);
         cJSON_AddStringToObject(root, "message", "Sin lecturas promediadas disponibles");
     } else {
         if (g_last_readings.timestamp[0]) {
@@ -577,12 +667,58 @@ static esp_err_t wifi_clear_get(httpd_req_t *r) {
     return wifi_clear_delete(r);
 }
 
+static esp_err_t config_post(httpd_req_t *r) {
+    char buf[256];
+    int len = httpd_req_recv(r, buf, sizeof(buf) - 1);
+    if (len <= 0) return httpd_resp_send_err(r, 400, "empty");
+    buf[len] = 0;
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) return httpd_resp_send_err(r, 400, "json");
+
+    cJSON *j_date = cJSON_GetObjectItem(root, "date");
+    cJSON *j_time = cJSON_GetObjectItem(root, "time");
+    if (!cJSON_IsString(j_date)) {
+        j_date = cJSON_GetObjectItem(root, "fecha");
+    }
+    if (!cJSON_IsString(j_time)) {
+        j_time = cJSON_GetObjectItem(root, "hora");
+    }
+
+    if (!cJSON_IsString(j_date) || !cJSON_IsString(j_time)) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(r, 400, "date/time required");
+    }
+
+    esp_err_t err = apply_device_time(j_date->valuestring, j_time->valuestring);
+    if (err != ESP_OK) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(r, 400, "invalid date/time");
+    }
+
+    cJSON *out = cJSON_CreateObject();
+    cJSON_AddBoolToObject(out, "ok", true);
+    cJSON_AddStringToObject(out, "device_id", (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor");
+    cJSON_AddBoolToObject(out, "time_valid", g_time_valid);
+    cJSON_AddStringToObject(out, "date", g_config_date);
+    cJSON_AddStringToObject(out, "time", g_config_time);
+    char *text = cJSON_PrintUnformatted(out);
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_sendstr(r, text);
+    free(text);
+    cJSON_Delete(out);
+    cJSON_Delete(root);
+    ESP_LOGI(TAG, "Fecha/hora configurada por servidor: %s %s", g_config_date, g_config_time);
+    return ESP_OK;
+}
+
 static httpd_uri_t uri_favicon          = { .uri="/favicon.ico", .method=HTTP_GET,    .handler=favicon_get };
 static httpd_uri_t uri_root             = { .uri="/",            .method=HTTP_GET,    .handler=root_get };
 static httpd_uri_t uri_scan             = { .uri="/scan",        .method=HTTP_GET,    .handler=scan_get };
 static httpd_uri_t uri_save             = { .uri="/save",        .method=HTTP_POST,   .handler=save_post };
 static httpd_uri_t uri_status           = { .uri="/status",      .method=HTTP_GET,    .handler=status_get };
 static httpd_uri_t uri_lecturas         = { .uri="/lecturas",    .method=HTTP_GET,    .handler=lecturas_get };
+static httpd_uri_t uri_config           = { .uri="/config",      .method=HTTP_POST,   .handler=config_post };
 static httpd_uri_t uri_wifi_clr         = { .uri="/wifi/clear",  .method=HTTP_DELETE, .handler=wifi_clear_delete };
 static httpd_uri_t uri_wifi_clr_get     = { .uri="/wifi/clear",  .method=HTTP_GET,    .handler=wifi_clear_get };
 
@@ -601,6 +737,7 @@ static esp_err_t start_http(void) {
         httpd_register_uri_handler(g_server, &uri_save);
         httpd_register_uri_handler(g_server, &uri_status);
         httpd_register_uri_handler(g_server, &uri_lecturas);
+        httpd_register_uri_handler(g_server, &uri_config);
         httpd_register_uri_handler(g_server, &uri_wifi_clr);
         httpd_register_uri_handler(g_server, &uri_wifi_clr_get);
         return ESP_OK;
@@ -627,12 +764,6 @@ static void start_mdns_service(void) {
     } else {
         ESP_LOGW(TAG, "mDNS init failed");
     }
-}
-
-static bool system_time_is_valid(void) {
-    time_t now = 0;
-    time(&now);
-    return now >= 1735689600;
 }
 
 static void get_active_ip_string(char *buf, size_t buf_size) {
