@@ -64,9 +64,13 @@ static void publish_latest_average(const SensorData *avg) {
     }
 
     uint32_t measurement_id = 0;
-    if (sd_store_append_reading(&snapshot, &measurement_id) == ESP_OK) {
+    esp_err_t sd_ret = sd_store_append_reading(&snapshot, &measurement_id);
+    if (sd_ret == ESP_OK) {
         snapshot.id = measurement_id;
         snapshot.measurement_id = measurement_id;
+        ESP_LOGI(TAG, "Medicion publicada y guardada en SD con id=%lu", (unsigned long)measurement_id);
+    } else {
+        ESP_LOGW(TAG, "Medicion publicada SIN guardar en SD: %s", esp_err_to_name(sd_ret));
     }
 
     captive_manager_set_last_readings(&snapshot);

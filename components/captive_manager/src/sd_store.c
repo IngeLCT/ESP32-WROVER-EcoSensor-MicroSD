@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,33 +30,46 @@ static bool file_exists(const char *path) {
 
 static void ensure_header(void) {
     if (file_exists(CSV_PATH)) {
+        ESP_LOGI(TAG, "CSV existente encontrado: %s", CSV_PATH);
         return;
     }
+    ESP_LOGI(TAG, "CSV no existe; creando archivo nuevo: %s", CSV_PATH);
     FILE *f = fopen(CSV_PATH, "w");
     if (!f) {
-        ESP_LOGW(TAG, "No se pudo crear CSV en SD");
+        ESP_LOGE(TAG, "No se pudo crear CSV en SD: %s errno=%d (%s)", CSV_PATH, errno, strerror(errno));
         return;
     }
-    fputs(CSV_HEADER, f);
-    fclose(f);
+    int written = fputs(CSV_HEADER, f);
+    if (written == EOF) {
+        ESP_LOGE(TAG, "Error escribiendo encabezado CSV: errno=%d (%s)", errno, strerror(errno));
+    } else {
+        ESP_LOGI(TAG, "Encabezado CSV creado correctamente");
+    }
+    if (fclose(f) != 0) {
+        ESP_LOGE(TAG, "Error cerrando CSV tras encabezado: errno=%d (%s)", errno, strerror(errno));
+    }
 }
 
 static uint32_t scan_last_id(void) {
     FILE *f = fopen(CSV_PATH, "r");
     if (!f) {
+        ESP_LOGW(TAG, "No se pudo abrir CSV para escanear ultimo ID: %s errno=%d (%s)", CSV_PATH, errno, strerror(errno));
         return 0;
     }
 
     char line[256];
     uint32_t last = 0;
+    uint32_t rows = 0;
     while (fgets(line, sizeof(line), f)) {
         char *end = NULL;
         unsigned long id = strtoul(line, &end, 10);
         if (end && *end == ',' && id > last) {
             last = (uint32_t)id;
+            rows++;
         }
     }
     fclose(f);
+    ESP_LOGI(TAG, "CSV escaneado: filas=%lu ultimo_id=%lu", (unsigned long)rows, (unsigned long)last);
     return last;
 }
 
@@ -66,6 +80,10 @@ esp_err_t sd_store_init(void) {
     if (!g_lock) {
         g_lock = xSemaphoreCreateMutex();
     }
+
+    ESP_LOGI(TAG, "Inicializando SD SPI: SCK=%d MISO=%d MOSI=%d CS=%d mount=%s csv=%s",
+             SD_STORE_PIN_SCK, SD_STORE_PIN_MISO, SD_STORE_PIN_MOSI, SD_STORE_PIN_CS,
+             MOUNT_POINT, CSV_PATH);
 
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
@@ -88,8 +106,13 @@ esp_err_t sd_store_init(void) {
 
     esp_err_t ret = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "No se pudo iniciar bus SPI SD: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "No se pudo iniciar bus SPI SD: %s", esp_err_to_name(ret));
         return ret;
+    }
+    if (ret == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Bus SPI SD ya estaba inicializado; continuo con el montaje");
+    } else {
+        ESP_LOGI(TAG, "Bus SPI SD inicializado correctamente");
     }
 
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
@@ -98,9 +121,12 @@ esp_err_t sd_store_init(void) {
 
     ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &card);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "No se pudo montar SD: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "No se pudo montar SD: %s", esp_err_to_name(ret));
         return ret;
     }
+
+    ESP_LOGI(TAG, "SD montada correctamente");
+    sdmmc_card_print_info(stdout, card);
 
     ensure_header();
     g_last_id = scan_last_id();
@@ -118,39 +144,84 @@ uint32_t sd_store_last_id(void) {
 }
 
 esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uint32_t *out_id) {
-    if (!g_ready || !reading || !reading->valid) {
+    if (!g_ready) {
+        ESP_LOGW(TAG, "No se guarda medicion: SD no esta lista");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!reading) {
+        ESP_LOGW(TAG, "No se guarda medicion: reading=NULL");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!reading->valid) {
+        ESP_LOGW(TAG, "No se guarda medicion: reading->valid=false");
         return ESP_ERR_INVALID_STATE;
     }
 
     if (g_lock) xSemaphoreTake(g_lock, portMAX_DELAY);
     uint32_t id = ++g_last_id;
+    ESP_LOGI(TAG,
+             "Guardando medicion SD id=%lu timestamp=%s co2=%u pm2.5=%.2f voc=%.2f nox=%.2f temp=%.2f hum=%.2f window_s=%lu",
+             (unsigned long)id,
+             reading->timestamp[0] ? reading->timestamp : "SIN_HORA",
+             reading->co2,
+             reading->pm2p5,
+             reading->voc,
+             reading->nox,
+             reading->temp,
+             reading->hum,
+             (unsigned long)reading->window_s);
+
     FILE *f = fopen(CSV_PATH, "a");
     if (!f) {
+        ESP_LOGE(TAG, "No se pudo abrir CSV para append: %s errno=%d (%s)", CSV_PATH, errno, strerror(errno));
         g_last_id--;
         if (g_lock) xSemaphoreGive(g_lock);
         return ESP_FAIL;
     }
 
-    fprintf(f,
-            "%lu,%s,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%lu\n",
-            (unsigned long)id,
-            reading->timestamp,
-            reading->co2,
-            reading->pm1p0,
-            reading->pm2p5,
-            reading->pm4p0,
-            reading->pm10p0,
-            reading->voc,
-            reading->nox,
-            reading->temp,
-            reading->hum,
-            (unsigned long)reading->window_s);
-    fclose(f);
+    int written = fprintf(f,
+                          "%lu,%s,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%lu\n",
+                          (unsigned long)id,
+                          reading->timestamp,
+                          reading->co2,
+                          reading->pm1p0,
+                          reading->pm2p5,
+                          reading->pm4p0,
+                          reading->pm10p0,
+                          reading->voc,
+                          reading->nox,
+                          reading->temp,
+                          reading->hum,
+                          (unsigned long)reading->window_s);
+    if (written < 0) {
+        ESP_LOGE(TAG, "fprintf fallo al escribir medicion id=%lu: errno=%d (%s)", (unsigned long)id, errno, strerror(errno));
+        fclose(f);
+        g_last_id--;
+        if (g_lock) xSemaphoreGive(g_lock);
+        return ESP_FAIL;
+    }
+
+    if (fflush(f) != 0) {
+        ESP_LOGE(TAG, "fflush fallo para medicion id=%lu: errno=%d (%s)", (unsigned long)id, errno, strerror(errno));
+        fclose(f);
+        g_last_id--;
+        if (g_lock) xSemaphoreGive(g_lock);
+        return ESP_FAIL;
+    }
+
+    if (fclose(f) != 0) {
+        ESP_LOGE(TAG, "fclose fallo para medicion id=%lu: errno=%d (%s)", (unsigned long)id, errno, strerror(errno));
+        g_last_id--;
+        if (g_lock) xSemaphoreGive(g_lock);
+        return ESP_FAIL;
+    }
+
     if (g_lock) xSemaphoreGive(g_lock);
 
     if (out_id) {
         *out_id = id;
     }
+    ESP_LOGI(TAG, "Medicion SD guardada OK id=%lu bytes=%d ultimo_id=%lu", (unsigned long)id, written, (unsigned long)g_last_id);
     return ESP_OK;
 }
 
