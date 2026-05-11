@@ -21,7 +21,7 @@ static const char *AP_PASS = "LCT3180940";
 #define SENSOR_TASK_STACK        8192
 #define SENSOR_START_TASK_STACK  4096
 #define SAMPLE_DELAY_MS          5000
-#define SAMPLES_PER_AVG_WINDOW   12
+#define SAMPLES_PER_AVG_WINDOW   60
 
 static void wifi_event_handler(void *arg,
                                esp_event_base_t base,
