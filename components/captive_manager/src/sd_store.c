@@ -16,7 +16,7 @@
 
 static const char *TAG = "sd_store";
 static const char *MOUNT_POINT = "/sdcard";
-static const char *CSV_PATH = "/sdcard/measurements.csv";
+static const char *CSV_PATH = "/sdcard/data.csv";
 static const char *CSV_HEADER = "id,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,window_s\n";
 
 static bool g_ready = false;
