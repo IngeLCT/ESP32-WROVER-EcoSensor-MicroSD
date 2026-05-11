@@ -34,6 +34,7 @@ static bool g_sensors_started = false;
 static bool g_time_valid = false;
 static char g_config_date[11] = {0};
 static char g_config_time[9] = {0};
+static char g_last_sync_source[16] = "none";
 static int  g_connect_attempts = 0;
 static int64_t g_boot_time_ms = 0;
 static captive_manager_readings_t g_last_readings = {0};
@@ -58,6 +59,7 @@ static bool validate_date_time(const char *date, const char *time_text);
 static esp_err_t apply_device_time(const char *date, const char *time_text);
 static void load_saved_device_time(void);
 static void get_active_ip_string(char *buf, size_t buf_size);
+static void get_current_datetime_string(char *buf, size_t buf_size);
 
 const char* captive_manager_state_str(captive_state_t st) {
     switch(st){
@@ -154,6 +156,7 @@ static esp_err_t apply_device_time(const char *date, const char *time_text) {
     snprintf(g_config_date, sizeof(g_config_date), "%s", date);
     snprintf(g_config_time, sizeof(g_config_time), "%s", time_text);
     g_time_valid = true;
+    snprintf(g_last_sync_source, sizeof(g_last_sync_source), "server");
 
     device_time_cfg_t cfg = {0};
     cfg.valid = true;
@@ -166,15 +169,17 @@ static void load_saved_device_time(void) {
     device_time_cfg_t cfg = {0};
     esp_err_t err = wifi_store_load_device_time(&cfg);
     if (err == ESP_OK && cfg.valid && validate_date_time(cfg.date, cfg.time)) {
-        if (apply_device_time(cfg.date, cfg.time) == ESP_OK) {
-            ESP_LOGI(TAG, "Fecha/hora cargada desde NVS: %s %s", cfg.date, cfg.time);
-            return;
-        }
+        snprintf(g_config_date, sizeof(g_config_date), "%s", cfg.date);
+        snprintf(g_config_time, sizeof(g_config_time), "%s", cfg.time);
+        ESP_LOGI(TAG, "Ultima fecha/hora guardada en NVS: %s %s (no se considera valida tras reinicio)", cfg.date, cfg.time);
+    } else {
+        g_config_date[0] = 0;
+        g_config_time[0] = 0;
     }
+
     g_time_valid = false;
-    g_config_date[0] = 0;
-    g_config_time[0] = 0;
-    ESP_LOGI(TAG, "Fecha/hora no configurada; sensores en espera hasta POST /config");
+    snprintf(g_last_sync_source, sizeof(g_last_sync_source), "none");
+    ESP_LOGI(TAG, "Fecha/hora requiere sincronizacion del servidor; sensores en espera hasta POST /time o POST /config");
 }
 
 esp_err_t captive_manager_init(const captive_manager_cfg_t *cfg) {
@@ -604,9 +609,20 @@ static esp_err_t status_get(httpd_req_t *r) {
     cJSON_AddStringToObject(root, "ip", ip_buf);
     cJSON_AddStringToObject(root, "mdns", mdns_name);
     cJSON_AddBoolToObject(root, "time_valid", g_time_valid);
+    cJSON_AddBoolToObject(root, "needs_time_sync", !g_time_valid);
+    cJSON_AddStringToObject(root, "last_sync_source", g_last_sync_source);
     if (g_time_valid) {
+        char current_datetime[32];
+        get_current_datetime_string(current_datetime, sizeof(current_datetime));
         cJSON_AddStringToObject(root, "date", g_config_date);
         cJSON_AddStringToObject(root, "time", g_config_time);
+        cJSON_AddStringToObject(root, "current_datetime", current_datetime);
+    } else {
+        cJSON_AddNullToObject(root, "current_datetime");
+        if (g_config_date[0] && g_config_time[0]) {
+            cJSON_AddStringToObject(root, "last_saved_date", g_config_date);
+            cJSON_AddStringToObject(root, "last_saved_time", g_config_time);
+        }
     }
     cJSON_AddStringToObject(root, "sensors", g_sensors_started ? "running" : "waiting");
     cJSON_AddStringToObject(root, "state", captive_manager_state_str(g_state));
@@ -719,6 +735,7 @@ static httpd_uri_t uri_save             = { .uri="/save",        .method=HTTP_PO
 static httpd_uri_t uri_status           = { .uri="/status",      .method=HTTP_GET,    .handler=status_get };
 static httpd_uri_t uri_lecturas         = { .uri="/lecturas",    .method=HTTP_GET,    .handler=lecturas_get };
 static httpd_uri_t uri_config           = { .uri="/config",      .method=HTTP_POST,   .handler=config_post };
+static httpd_uri_t uri_time             = { .uri="/time",        .method=HTTP_POST,   .handler=config_post };
 static httpd_uri_t uri_wifi_clr         = { .uri="/wifi/clear",  .method=HTTP_DELETE, .handler=wifi_clear_delete };
 static httpd_uri_t uri_wifi_clr_get     = { .uri="/wifi/clear",  .method=HTTP_GET,    .handler=wifi_clear_get };
 
@@ -738,6 +755,7 @@ static esp_err_t start_http(void) {
         httpd_register_uri_handler(g_server, &uri_status);
         httpd_register_uri_handler(g_server, &uri_lecturas);
         httpd_register_uri_handler(g_server, &uri_config);
+        httpd_register_uri_handler(g_server, &uri_time);
         httpd_register_uri_handler(g_server, &uri_wifi_clr);
         httpd_register_uri_handler(g_server, &uri_wifi_clr_get);
         return ESP_OK;
@@ -764,6 +782,18 @@ static void start_mdns_service(void) {
     } else {
         ESP_LOGW(TAG, "mDNS init failed");
     }
+}
+
+static void get_current_datetime_string(char *buf, size_t buf_size) {
+    if (!buf || buf_size == 0) {
+        return;
+    }
+
+    time_t now = 0;
+    struct tm tm_now = {0};
+    time(&now);
+    localtime_r(&now, &tm_now);
+    strftime(buf, buf_size, "%d-%m-%Y %H:%M:%S", &tm_now);
 }
 
 static void get_active_ip_string(char *buf, size_t buf_size) {
