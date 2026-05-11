@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <time.h>
 
+#include "driver/gpio.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
@@ -22,6 +23,7 @@ static const char *AP_PASS = "LCT3180940";
 #define SENSOR_START_TASK_STACK  4096
 #define SAMPLE_DELAY_MS          5000
 #define SAMPLES_PER_AVG_WINDOW   60
+#define BOARD_POWERON_PIN        GPIO_NUM_12
 
 static void wifi_event_handler(void *arg,
                                esp_event_base_t base,
@@ -37,6 +39,20 @@ static void wifi_event_handler(void *arg,
 
 static TaskHandle_t s_sensor_task_handle = NULL;
 static bool s_sensors_started = false;
+
+static void enable_board_peripherals_power(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << BOARD_POWERON_PIN,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    ESP_ERROR_CHECK(gpio_set_level(BOARD_POWERON_PIN, 1));
+    ESP_LOGI(TAG, "Alimentacion de perifericos habilitada en GPIO%d para SD/modem", BOARD_POWERON_PIN);
+    vTaskDelay(pdMS_TO_TICKS(150));
+}
 
 static void publish_latest_average(const SensorData *avg) {
     if (!avg) {
@@ -229,6 +245,8 @@ static void sensor_start_task(void *pv) {
 
 void app_main(void)
 {
+    enable_board_peripherals_power();
+
     captive_manager_cfg_t cfg = {
         .ap_ssid = AP_SSID,
         .ap_pass = AP_PASS,
