@@ -1,5 +1,6 @@
 #include "captive_manager.h"
 #include "wifi_store.h"
+#include "sd_store.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -305,8 +306,8 @@ static esp_err_t apply_saved_sta_ip_config(void) {
 
 static void connect_sta(const char *ssid, const char *pass, bool from_saved) {
     wifi_config_t sta_cfg = {0};
-    snprintf((char*)sta_cfg.sta.ssid, sizeof(sta_cfg.sta.ssid), "%s", ssid);
-    snprintf((char*)sta_cfg.sta.password, sizeof(sta_cfg.sta.password), "%s", pass ? pass : "");
+    strlcpy((char*)sta_cfg.sta.ssid, ssid, sizeof(sta_cfg.sta.ssid));
+    strlcpy((char*)sta_cfg.sta.password, pass ? pass : "", sizeof(sta_cfg.sta.password));
     sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -608,6 +609,8 @@ static esp_err_t status_get(httpd_req_t *r) {
     cJSON_AddStringToObject(root, "wifi", wifi);
     cJSON_AddStringToObject(root, "ip", ip_buf);
     cJSON_AddStringToObject(root, "mdns", mdns_name);
+    cJSON_AddBoolToObject(root, "sd_ready", sd_store_is_ready());
+    cJSON_AddNumberToObject(root, "sd_last_id", sd_store_last_id());
     cJSON_AddBoolToObject(root, "time_valid", g_time_valid);
     cJSON_AddBoolToObject(root, "needs_time_sync", !g_time_valid);
     cJSON_AddStringToObject(root, "last_sync_source", g_last_sync_source);
@@ -647,6 +650,8 @@ static esp_err_t lecturas_get(httpd_req_t *r) {
         cJSON_AddBoolToObject(root, "time_valid", g_time_valid);
         cJSON_AddStringToObject(root, "message", "Sin lecturas promediadas disponibles");
     } else {
+        cJSON_AddNumberToObject(root, "id", g_last_readings.measurement_id);
+        cJSON_AddNumberToObject(root, "measurement_id", g_last_readings.measurement_id);
         if (g_last_readings.timestamp[0]) {
             cJSON_AddStringToObject(root, "timestamp", g_last_readings.timestamp);
         } else {
@@ -662,6 +667,45 @@ static esp_err_t lecturas_get(httpd_req_t *r) {
         cJSON_AddNumberToObject(root, "temp", g_last_readings.temp);
         cJSON_AddNumberToObject(root, "hum", g_last_readings.hum);
     }
+
+    char *out = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_sendstr(r, out);
+    free(out);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t lecturas_since_get(httpd_req_t *r) {
+    char query[96] = {0};
+    uint32_t after_id = 0;
+    uint32_t limit = 500;
+
+    if (httpd_req_get_url_query_str(r, query, sizeof(query)) == ESP_OK) {
+        char value[24] = {0};
+        if (httpd_query_key_value(query, "after", value, sizeof(value)) == ESP_OK ||
+            httpd_query_key_value(query, "after_id", value, sizeof(value)) == ESP_OK ||
+            httpd_query_key_value(query, "since", value, sizeof(value)) == ESP_OK) {
+            after_id = (uint32_t)strtoul(value, NULL, 10);
+        }
+        if (httpd_query_key_value(query, "limit", value, sizeof(value)) == ESP_OK) {
+            limit = (uint32_t)strtoul(value, NULL, 10);
+        }
+    }
+
+    const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
+    cJSON *root = cJSON_CreateObject();
+    cJSON *rows = cJSON_CreateArray();
+    uint32_t added = 0;
+    esp_err_t err = sd_store_add_readings_since(rows, after_id, limit, &added);
+
+    cJSON_AddBoolToObject(root, "ok", err == ESP_OK);
+    cJSON_AddStringToObject(root, "device_id", device_id);
+    cJSON_AddBoolToObject(root, "sd_ready", sd_store_is_ready());
+    cJSON_AddNumberToObject(root, "after_id", after_id);
+    cJSON_AddNumberToObject(root, "last_id", sd_store_last_id());
+    cJSON_AddNumberToObject(root, "count", added);
+    cJSON_AddItemToObject(root, "rows", rows);
 
     char *out = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(r, "application/json");
@@ -734,6 +778,7 @@ static httpd_uri_t uri_scan             = { .uri="/scan",        .method=HTTP_GE
 static httpd_uri_t uri_save             = { .uri="/save",        .method=HTTP_POST,   .handler=save_post };
 static httpd_uri_t uri_status           = { .uri="/status",      .method=HTTP_GET,    .handler=status_get };
 static httpd_uri_t uri_lecturas         = { .uri="/lecturas",    .method=HTTP_GET,    .handler=lecturas_get };
+static httpd_uri_t uri_lecturas_since   = { .uri="/lecturas/since", .method=HTTP_GET,  .handler=lecturas_since_get };
 static httpd_uri_t uri_config           = { .uri="/config",      .method=HTTP_POST,   .handler=config_post };
 static httpd_uri_t uri_time             = { .uri="/time",        .method=HTTP_POST,   .handler=config_post };
 static httpd_uri_t uri_wifi_clr         = { .uri="/wifi/clear",  .method=HTTP_DELETE, .handler=wifi_clear_delete };
@@ -754,6 +799,7 @@ static esp_err_t start_http(void) {
         httpd_register_uri_handler(g_server, &uri_save);
         httpd_register_uri_handler(g_server, &uri_status);
         httpd_register_uri_handler(g_server, &uri_lecturas);
+        httpd_register_uri_handler(g_server, &uri_lecturas_since);
         httpd_register_uri_handler(g_server, &uri_config);
         httpd_register_uri_handler(g_server, &uri_time);
         httpd_register_uri_handler(g_server, &uri_wifi_clr);

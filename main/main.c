@@ -8,6 +8,7 @@
 #include "freertos/task.h"
 
 #include "captive_manager.h"
+#include "sd_store.h"
 #include "sensors.h"
 
 static const char *TAG = "EcoSensor";
@@ -60,6 +61,12 @@ static void publish_latest_average(const SensorData *avg) {
         struct tm utc_tm = {0};
         gmtime_r(&now, &utc_tm);
         strftime(snapshot.timestamp, sizeof(snapshot.timestamp), "%Y-%m-%dT%H:%M:%SZ", &utc_tm);
+    }
+
+    uint32_t measurement_id = 0;
+    if (sd_store_append_reading(&snapshot, &measurement_id) == ESP_OK) {
+        snapshot.id = measurement_id;
+        snapshot.measurement_id = measurement_id;
     }
 
     captive_manager_set_last_readings(&snapshot);
@@ -233,6 +240,11 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &wifi_event_handler, NULL));
     captive_manager_set_sensors_started(false);
     ESP_ERROR_CHECK(captive_manager_start());
+
+    esp_err_t sd_ret = sd_store_init();
+    if (sd_ret != ESP_OK) {
+        ESP_LOGW(TAG, "SD no disponible; lecturas solo en memoria hasta resolver SD: %s", esp_err_to_name(sd_ret));
+    }
 
     ESP_LOGI(TAG, "WiFi manager iniciado");
     ESP_LOGI(TAG, "mDNS: %s.local", MDNS_HOSTNAME);

@@ -29,6 +29,8 @@ typedef struct {
 
 typedef struct {
     bool valid;
+    uint32_t id;
+    uint32_t measurement_id;
     uint32_t window_s;
     char timestamp[32];
     uint16_t co2;
