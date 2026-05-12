@@ -143,6 +143,37 @@ uint32_t sd_store_last_id(void) {
     return g_last_id;
 }
 
+esp_err_t sd_store_clear(void) {
+    if (!g_ready) {
+        ESP_LOGW(TAG, "No se puede borrar CSV: SD no esta lista");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (g_lock) xSemaphoreTake(g_lock, portMAX_DELAY);
+    FILE *f = fopen(CSV_PATH, "w");
+    if (!f) {
+        ESP_LOGE(TAG, "No se pudo truncar CSV: %s errno=%d (%s)", CSV_PATH, errno, strerror(errno));
+        if (g_lock) xSemaphoreGive(g_lock);
+        return ESP_FAIL;
+    }
+    int written = fputs(CSV_HEADER, f);
+    if (written == EOF) {
+        ESP_LOGE(TAG, "No se pudo reescribir encabezado CSV: errno=%d (%s)", errno, strerror(errno));
+        fclose(f);
+        if (g_lock) xSemaphoreGive(g_lock);
+        return ESP_FAIL;
+    }
+    if (fclose(f) != 0) {
+        ESP_LOGE(TAG, "Error cerrando CSV tras borrado: errno=%d (%s)", errno, strerror(errno));
+        if (g_lock) xSemaphoreGive(g_lock);
+        return ESP_FAIL;
+    }
+    g_last_id = 0;
+    if (g_lock) xSemaphoreGive(g_lock);
+    ESP_LOGI(TAG, "Historial SD borrado correctamente; ultimo_id=0");
+    return ESP_OK;
+}
+
 esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uint32_t *out_id) {
     if (!g_ready) {
         ESP_LOGW(TAG, "No se guarda medicion: SD no esta lista");

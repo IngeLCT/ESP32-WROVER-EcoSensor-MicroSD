@@ -746,6 +746,31 @@ static esp_err_t wifi_clear_get(httpd_req_t *r) {
     return wifi_clear_delete(r);
 }
 
+static esp_err_t readings_clear_delete(httpd_req_t *r) {
+    esp_err_t err = sd_store_clear();
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", err == ESP_OK);
+    cJSON_AddStringToObject(root, "device_id", (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor");
+    cJSON_AddBoolToObject(root, "sd_ready", sd_store_is_ready());
+    cJSON_AddNumberToObject(root, "last_id", sd_store_last_id());
+    if (err != ESP_OK) {
+        cJSON_AddStringToObject(root, "error", esp_err_to_name(err));
+    }
+
+    char *text = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_status(r, err == ESP_OK ? "200 OK" : "500 Internal Server Error");
+    httpd_resp_sendstr(r, text);
+    free(text);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t readings_clear_get(httpd_req_t *r) {
+    return readings_clear_delete(r);
+}
+
 static esp_err_t config_post(httpd_req_t *r) {
     char buf[256];
     int len = httpd_req_recv(r, buf, sizeof(buf) - 1);
@@ -802,6 +827,8 @@ static httpd_uri_t uri_config           = { .uri="/config",      .method=HTTP_PO
 static httpd_uri_t uri_time             = { .uri="/time",        .method=HTTP_POST,   .handler=config_post };
 static httpd_uri_t uri_wifi_clr         = { .uri="/wifi/clear",  .method=HTTP_DELETE, .handler=wifi_clear_delete };
 static httpd_uri_t uri_wifi_clr_get     = { .uri="/wifi/clear",  .method=HTTP_GET,    .handler=wifi_clear_get };
+static httpd_uri_t uri_readings_clr     = { .uri="/lecturas/clear", .method=HTTP_DELETE, .handler=readings_clear_delete };
+static httpd_uri_t uri_readings_clr_get = { .uri="/lecturas/clear", .method=HTTP_GET,    .handler=readings_clear_get };
 
 static esp_err_t start_http(void) {
     if (g_server) return ESP_OK;
@@ -823,6 +850,8 @@ static esp_err_t start_http(void) {
         httpd_register_uri_handler(g_server, &uri_time);
         httpd_register_uri_handler(g_server, &uri_wifi_clr);
         httpd_register_uri_handler(g_server, &uri_wifi_clr_get);
+        httpd_register_uri_handler(g_server, &uri_readings_clr);
+        httpd_register_uri_handler(g_server, &uri_readings_clr_get);
         return ESP_OK;
     }
 

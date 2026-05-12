@@ -21,6 +21,7 @@ bool sd_store_is_ready(void);
 uint32_t sd_store_last_id(void);
 esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uint32_t *out_id);
 esp_err_t sd_store_add_readings_since(cJSON *array, uint32_t after_id, uint32_t limit, uint32_t *added);
+esp_err_t sd_store_clear(void);
 
 #ifdef __cplusplus
 }
