@@ -3,6 +3,7 @@
 
 #include "driver/gpio.h"
 #include "esp_event.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -23,6 +24,7 @@ static const char *AP_PASS = "LCT3180940";
 #define SENSOR_START_TASK_STACK  4096
 #define SAMPLE_DELAY_MS          5000
 #define SAMPLES_PER_AVG_WINDOW   60
+#define SEN51_VOC_NOX_WARMUP_MS  120000
 #define BOARD_POWERON_PIN        GPIO_NUM_12
 
 static void wifi_event_handler(void *arg,
@@ -62,6 +64,8 @@ static void publish_latest_average(const SensorData *avg) {
     captive_manager_readings_t snapshot = {0};
     snapshot.valid = true;
     snapshot.window_s = (SAMPLE_DELAY_MS * SAMPLES_PER_AVG_WINDOW) / 1000;
+    snapshot.boot_id = captive_manager_boot_id();
+    snapshot.uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
     snapshot.co2 = avg->co2;
     snapshot.pm1p0 = avg->pm1p0;
     snapshot.pm2p5 = avg->pm2p5;
@@ -72,7 +76,8 @@ static void publish_latest_average(const SensorData *avg) {
     snapshot.temp = avg->avg_temp;
     snapshot.hum = avg->avg_hum;
 
-    if (captive_manager_time_is_valid()) {
+    snapshot.time_valid = captive_manager_time_is_valid();
+    if (snapshot.time_valid) {
         time_t now = time(NULL);
         struct tm utc_tm = {0};
         gmtime_r(&now, &utc_tm);
@@ -94,11 +99,15 @@ static void publish_latest_average(const SensorData *avg) {
 
 static void sensor_task(void *pv) {
     const TickType_t sample_delay_ticks = pdMS_TO_TICKS(SAMPLE_DELAY_MS);
+    const TickType_t voc_nox_warmup_ticks = pdMS_TO_TICKS(SEN51_VOC_NOX_WARMUP_MS);
+    const TickType_t sensor_start_tick = xTaskGetTickCount();
 
     int sample_slot = 0;
     uint32_t sum_co2 = 0;
     int scd40_ok_count = 0;
     int sen55_ok_count = 0;
+    int voc_nox_ok_count = 0;
+    bool voc_nox_warmup_logged = false;
 
     double sum_pm1p0 = 0;
     double sum_pm2p5 = 0;
@@ -132,8 +141,20 @@ static void sensor_task(void *pv) {
             sum_pm2p5 += data.pm2p5;
             sum_pm4p0 += data.pm4p0;
             sum_pm10p0 += data.pm10p0;
-            sum_voc += data.voc;
-            sum_nox += data.nox;
+
+            TickType_t elapsed_ticks = xTaskGetTickCount() - sensor_start_tick;
+            bool voc_nox_ready = elapsed_ticks >= voc_nox_warmup_ticks;
+            if (voc_nox_ready) {
+                sum_voc += data.voc;
+                sum_nox += data.nox;
+                voc_nox_ok_count++;
+            } else if (!voc_nox_warmup_logged) {
+                ESP_LOGI(TAG,
+                         "SEN51 VOC/NOx en estabilizacion; se ignoraran los primeros %d s tras iniciar sensores",
+                         SEN51_VOC_NOX_WARMUP_MS / 1000);
+                voc_nox_warmup_logged = true;
+            }
+
             sum_sen_temp += data.sen_temp;
             sum_sen_hum += data.sen_hum;
             sum_avg_temp += data.avg_temp;
@@ -174,8 +195,11 @@ static void sensor_task(void *pv) {
                 window_avg.pm2p5 = (float)(sum_pm2p5 / denom);
                 window_avg.pm4p0 = (float)(sum_pm4p0 / denom);
                 window_avg.pm10p0 = (float)(sum_pm10p0 / denom);
-                window_avg.voc = (float)(sum_voc / denom);
-                window_avg.nox = (float)(sum_nox / denom);
+                if (voc_nox_ok_count > 0) {
+                    double voc_nox_denom = (double)voc_nox_ok_count;
+                    window_avg.voc = (float)(sum_voc / voc_nox_denom);
+                    window_avg.nox = (float)(sum_nox / voc_nox_denom);
+                }
                 window_avg.sen_temp = (float)(sum_sen_temp / denom);
                 window_avg.sen_hum = (float)(sum_sen_hum / denom);
                 window_avg.avg_temp = (float)(sum_avg_temp / denom);
@@ -185,12 +209,17 @@ static void sensor_task(void *pv) {
             char json[320];
             sensors_format_json(&window_avg, json, sizeof(json));
             publish_latest_average(&window_avg);
-            ESP_LOGI(TAG, "Promedio 1 min: %s", json);
+            ESP_LOGI(TAG,
+                     "Promedio %d s: %s (VOC/NOx muestras validas=%d)",
+                     (SAMPLE_DELAY_MS * SAMPLES_PER_AVG_WINDOW) / 1000,
+                     json,
+                     voc_nox_ok_count);
 
             sample_slot = 0;
             sum_co2 = 0;
             scd40_ok_count = 0;
             sen55_ok_count = 0;
+            voc_nox_ok_count = 0;
             sum_pm1p0 = 0;
             sum_pm2p5 = 0;
             sum_pm4p0 = 0;
@@ -212,14 +241,10 @@ static void sensor_task(void *pv) {
 static void sensor_start_task(void *pv) {
     while (1) {
         captive_state_t st = captive_manager_get_state();
-        if (st == CAP_STATE_OPERATIONAL && !captive_manager_time_is_valid()) {
-            ESP_LOGI(TAG, "WiFi operativo; esperando configuracion de fecha/hora via POST /config");
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-        }
-
         if (st == CAP_STATE_OPERATIONAL) {
-            ESP_LOGI(TAG, "WiFi, fecha y hora configurados; iniciando sensores");
+            ESP_LOGI(TAG,
+                     "WiFi operativo; iniciando sensores (time_valid=%s)",
+                     captive_manager_time_is_valid() ? "true" : "false");
 
             esp_err_t sret = sensors_init_all();
             if (sret != ESP_OK) {
@@ -231,12 +256,12 @@ static void sensor_start_task(void *pv) {
             xTaskCreate(sensor_task, "sensor_task", SENSOR_TASK_STACK, NULL, 5, &s_sensor_task_handle);
             s_sensors_started = true;
             captive_manager_set_sensors_started(true);
-            ESP_LOGI(TAG, "Sensores y promedio iniciados despues de la configuracion WiFi");
+            ESP_LOGI(TAG, "Sensores y promedio iniciados");
             vTaskDelete(NULL);
             return;
         }
 
-        ESP_LOGI(TAG, "Esperando WiFi y fecha/hora para iniciar sensores... estado=%s time_valid=%s",
+        ESP_LOGI(TAG, "Esperando WiFi para iniciar sensores... estado=%s time_valid=%s",
                  captive_manager_state_str(st),
                  captive_manager_time_is_valid() ? "true" : "false");
         vTaskDelay(pdMS_TO_TICKS(1000));

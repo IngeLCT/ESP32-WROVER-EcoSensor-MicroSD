@@ -1,6 +1,7 @@
 #pragma once
 #include "esp_err.h"
 #include "stdbool.h"
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,7 +32,10 @@ typedef struct {
     bool valid;
     uint32_t id;
     uint32_t measurement_id;
+    uint32_t boot_id;
+    uint32_t uptime_s;
     uint32_t window_s;
+    bool time_valid;
     char timestamp[32];
     uint16_t co2;
     float pm1p0;
@@ -58,6 +62,7 @@ bool captive_manager_using_saved(void);
 void captive_manager_set_sensors_started(bool started);
 void captive_manager_set_last_readings(const captive_manager_readings_t *readings);
 bool captive_manager_time_is_valid(void);
+uint32_t captive_manager_boot_id(void);
 
 #ifdef __cplusplus
 }

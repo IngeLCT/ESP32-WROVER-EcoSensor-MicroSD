@@ -17,7 +17,7 @@
 static const char *TAG = "sd_store";
 static const char *MOUNT_POINT = "/sdcard";
 static const char *CSV_PATH = "/sdcard/data.csv";
-static const char *CSV_HEADER = "id,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,window_s\n";
+static const char *CSV_HEADER = "id,boot_id,uptime_s,time_valid,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,window_s\n";
 
 static bool g_ready = false;
 static uint32_t g_last_id = 0;
@@ -160,8 +160,11 @@ esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uin
     if (g_lock) xSemaphoreTake(g_lock, portMAX_DELAY);
     uint32_t id = ++g_last_id;
     ESP_LOGI(TAG,
-             "Guardando medicion SD id=%lu timestamp=%s co2=%u pm2.5=%.2f voc=%.2f nox=%.2f temp=%.2f hum=%.2f window_s=%lu",
+             "Guardando medicion SD id=%lu boot_id=%lu uptime_s=%lu time_valid=%s timestamp=%s co2=%u pm2.5=%.2f voc=%.2f nox=%.2f temp=%.2f hum=%.2f window_s=%lu",
              (unsigned long)id,
+             (unsigned long)reading->boot_id,
+             (unsigned long)reading->uptime_s,
+             reading->time_valid ? "true" : "false",
              reading->timestamp[0] ? reading->timestamp : "SIN_HORA",
              reading->co2,
              reading->pm2p5,
@@ -180,8 +183,11 @@ esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uin
     }
 
     int written = fprintf(f,
-                          "%lu,%s,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%lu\n",
+                          "%lu,%lu,%lu,%u,%s,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%lu\n",
                           (unsigned long)id,
+                          (unsigned long)reading->boot_id,
+                          (unsigned long)reading->uptime_s,
+                          reading->time_valid ? 1U : 0U,
                           reading->timestamp,
                           reading->co2,
                           reading->pm1p0,
@@ -225,39 +231,120 @@ esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uin
     return ESP_OK;
 }
 
-static bool parse_csv_line(const char *line, uint32_t *id, char *timestamp, size_t timestamp_size,
-                           uint32_t *co2, float *pm1p0, float *pm2p5, float *pm4p0, float *pm10p0,
-                           float *voc, float *nox, float *temp, float *hum, uint32_t *window_s) {
-    if (!line || !id || !timestamp || timestamp_size == 0) {
+typedef struct {
+    uint32_t id;
+    uint32_t boot_id;
+    uint32_t uptime_s;
+    bool time_valid;
+    char timestamp[32];
+    uint32_t co2;
+    float pm1p0;
+    float pm2p5;
+    float pm4p0;
+    float pm10p0;
+    float voc;
+    float nox;
+    float temp;
+    float hum;
+    uint32_t window_s;
+} sd_store_row_t;
+
+static bool parse_u32_field(const char *text, uint32_t *out) {
+    if (!text || !out || text[0] == '\0') {
+        return false;
+    }
+    char *end = NULL;
+    unsigned long value = strtoul(text, &end, 10);
+    if (!end || *end != '\0') {
+        return false;
+    }
+    *out = (uint32_t)value;
+    return true;
+}
+
+static bool parse_float_field(const char *text, float *out) {
+    if (!text || !out || text[0] == '\0') {
+        return false;
+    }
+    char *end = NULL;
+    float value = strtof(text, &end);
+    if (!end || *end != '\0') {
+        return false;
+    }
+    *out = value;
+    return true;
+}
+
+static int split_csv_simple(char *line, char **fields, int max_fields) {
+    int count = 0;
+    char *start = line;
+    for (char *p = line; *p && count < max_fields; ++p) {
+        if (*p == '\r' || *p == '\n') {
+            *p = '\0';
+            break;
+        }
+        if (*p == ',') {
+            *p = '\0';
+            fields[count++] = start;
+            start = p + 1;
+        }
+    }
+    if (count < max_fields) {
+        fields[count++] = start;
+    }
+    return count;
+}
+
+static bool parse_csv_line(const char *line, sd_store_row_t *row) {
+    if (!line || !row) {
         return false;
     }
 
-    char ts[32] = {0};
-    unsigned long parsed_id = 0;
-    unsigned long parsed_co2 = 0;
-    unsigned long parsed_window_s = 0;
-    int matched = sscanf(line,
-                         "%lu,%31[^,],%lu,%f,%f,%f,%f,%f,%f,%f,%f,%lu",
-                         &parsed_id,
-                         ts,
-                         &parsed_co2,
-                         pm1p0,
-                         pm2p5,
-                         pm4p0,
-                         pm10p0,
-                         voc,
-                         nox,
-                         temp,
-                         hum,
-                         &parsed_window_s);
-    if (matched != 12) {
-        return false;
+    char copy[320];
+    snprintf(copy, sizeof(copy), "%s", line);
+
+    char *fields[20] = {0};
+    int n = split_csv_simple(copy, fields, 20);
+    memset(row, 0, sizeof(*row));
+
+    // Formato nuevo:
+    // id,boot_id,uptime_s,time_valid,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,window_s
+    if (n >= 15 && parse_u32_field(fields[0], &row->id) && parse_u32_field(fields[1], &row->boot_id)) {
+        uint32_t time_valid = 0;
+        return parse_u32_field(fields[2], &row->uptime_s) &&
+               parse_u32_field(fields[3], &time_valid) &&
+               (row->time_valid = time_valid != 0, true) &&
+               (snprintf(row->timestamp, sizeof(row->timestamp), "%s", fields[4] ? fields[4] : ""), true) &&
+               parse_u32_field(fields[5], &row->co2) &&
+               parse_float_field(fields[6], &row->pm1p0) &&
+               parse_float_field(fields[7], &row->pm2p5) &&
+               parse_float_field(fields[8], &row->pm4p0) &&
+               parse_float_field(fields[9], &row->pm10p0) &&
+               parse_float_field(fields[10], &row->voc) &&
+               parse_float_field(fields[11], &row->nox) &&
+               parse_float_field(fields[12], &row->temp) &&
+               parse_float_field(fields[13], &row->hum) &&
+               parse_u32_field(fields[14], &row->window_s);
     }
-    *id = (uint32_t)parsed_id;
-    *co2 = (uint32_t)parsed_co2;
-    *window_s = (uint32_t)parsed_window_s;
-    snprintf(timestamp, timestamp_size, "%s", ts);
-    return true;
+
+    // Compatibilidad con formato anterior:
+    // id,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,window_s
+    if (n >= 12 && parse_u32_field(fields[0], &row->id)) {
+        row->time_valid = fields[1] && fields[1][0] != '\0';
+        snprintf(row->timestamp, sizeof(row->timestamp), "%s", fields[1] ? fields[1] : "");
+        return parse_u32_field(fields[2], &row->co2) &&
+               parse_float_field(fields[3], &row->pm1p0) &&
+               parse_float_field(fields[4], &row->pm2p5) &&
+               parse_float_field(fields[5], &row->pm4p0) &&
+               parse_float_field(fields[6], &row->pm10p0) &&
+               parse_float_field(fields[7], &row->voc) &&
+               parse_float_field(fields[8], &row->nox) &&
+               parse_float_field(fields[9], &row->temp) &&
+               parse_float_field(fields[10], &row->hum) &&
+               parse_u32_field(fields[11], &row->window_s);
+    }
+
+    return false;
 }
 
 esp_err_t sd_store_add_readings_since(cJSON *array, uint32_t after_id, uint32_t limit, uint32_t *added) {
@@ -275,35 +362,39 @@ esp_err_t sd_store_add_readings_since(cJSON *array, uint32_t after_id, uint32_t 
         return ESP_FAIL;
     }
 
-    char line[256];
+    char line[320];
     uint32_t count = 0;
     while (fgets(line, sizeof(line), f) && count < limit) {
-        uint32_t id = 0;
-        uint32_t co2 = 0;
-        uint32_t window_s = 0;
-        float pm1p0 = 0, pm2p5 = 0, pm4p0 = 0, pm10p0 = 0, voc = 0, nox = 0, temp = 0, hum = 0;
-        char timestamp[32] = {0};
-        if (!parse_csv_line(line, &id, timestamp, sizeof(timestamp), &co2, &pm1p0, &pm2p5, &pm4p0, &pm10p0, &voc, &nox, &temp, &hum, &window_s)) {
+        sd_store_row_t parsed = {0};
+        if (!parse_csv_line(line, &parsed)) {
             continue;
         }
-        if (id <= after_id) {
+        if (parsed.id <= after_id) {
             continue;
         }
 
         cJSON *row = cJSON_CreateObject();
-        cJSON_AddNumberToObject(row, "id", id);
-        cJSON_AddNumberToObject(row, "measurement_id", id);
-        cJSON_AddStringToObject(row, "timestamp", timestamp);
-        cJSON_AddNumberToObject(row, "co2", co2);
-        cJSON_AddNumberToObject(row, "pm1p0", pm1p0);
-        cJSON_AddNumberToObject(row, "pm2p5", pm2p5);
-        cJSON_AddNumberToObject(row, "pm4p0", pm4p0);
-        cJSON_AddNumberToObject(row, "pm10p0", pm10p0);
-        cJSON_AddNumberToObject(row, "voc", voc);
-        cJSON_AddNumberToObject(row, "nox", nox);
-        cJSON_AddNumberToObject(row, "temp", temp);
-        cJSON_AddNumberToObject(row, "hum", hum);
-        cJSON_AddNumberToObject(row, "window_s", window_s);
+        cJSON_AddNumberToObject(row, "id", parsed.id);
+        cJSON_AddNumberToObject(row, "measurement_id", parsed.id);
+        cJSON_AddNumberToObject(row, "boot_id", parsed.boot_id);
+        cJSON_AddNumberToObject(row, "uptime_s", parsed.uptime_s);
+        cJSON_AddBoolToObject(row, "time_valid", parsed.time_valid);
+        cJSON_AddStringToObject(row, "time_source", parsed.time_valid ? "esp" : "pending_estimate");
+        if (parsed.timestamp[0]) {
+            cJSON_AddStringToObject(row, "timestamp", parsed.timestamp);
+        } else {
+            cJSON_AddNullToObject(row, "timestamp");
+        }
+        cJSON_AddNumberToObject(row, "co2", parsed.co2);
+        cJSON_AddNumberToObject(row, "pm1p0", parsed.pm1p0);
+        cJSON_AddNumberToObject(row, "pm2p5", parsed.pm2p5);
+        cJSON_AddNumberToObject(row, "pm4p0", parsed.pm4p0);
+        cJSON_AddNumberToObject(row, "pm10p0", parsed.pm10p0);
+        cJSON_AddNumberToObject(row, "voc", parsed.voc);
+        cJSON_AddNumberToObject(row, "nox", parsed.nox);
+        cJSON_AddNumberToObject(row, "temp", parsed.temp);
+        cJSON_AddNumberToObject(row, "hum", parsed.hum);
+        cJSON_AddNumberToObject(row, "window_s", parsed.window_s);
         cJSON_AddItemToArray(array, row);
         count++;
     }

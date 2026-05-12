@@ -33,6 +33,7 @@ static bool g_sta_have_ip = false;
 static bool g_using_saved = false;
 static bool g_sensors_started = false;
 static bool g_time_valid = false;
+static uint32_t g_boot_id = 0;
 static char g_config_date[11] = {0};
 static char g_config_time[9] = {0};
 static char g_last_sync_source[16] = "none";
@@ -105,6 +106,10 @@ void captive_manager_set_last_readings(const captive_manager_readings_t *reading
 
 bool captive_manager_time_is_valid(void) {
     return g_time_valid;
+}
+
+uint32_t captive_manager_boot_id(void) {
+    return g_boot_id;
 }
 
 static bool validate_date_time(const char *date, const char *time_text) {
@@ -186,6 +191,10 @@ static void load_saved_device_time(void) {
 esp_err_t captive_manager_init(const captive_manager_cfg_t *cfg) {
     if (!cfg) return ESP_ERR_INVALID_ARG;
     g_cfg = *cfg;
+    g_boot_id = esp_random();
+    if (g_boot_id == 0) {
+        g_boot_id = 1;
+    }
 
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -611,6 +620,8 @@ static esp_err_t status_get(httpd_req_t *r) {
     cJSON_AddStringToObject(root, "mdns", mdns_name);
     cJSON_AddBoolToObject(root, "sd_ready", sd_store_is_ready());
     cJSON_AddNumberToObject(root, "sd_last_id", sd_store_last_id());
+    cJSON_AddNumberToObject(root, "boot_id", g_boot_id);
+    cJSON_AddNumberToObject(root, "current_uptime_s", (double)(esp_timer_get_time() / 1000000ULL));
     cJSON_AddBoolToObject(root, "time_valid", g_time_valid);
     cJSON_AddBoolToObject(root, "needs_time_sync", !g_time_valid);
     cJSON_AddStringToObject(root, "last_sync_source", g_last_sync_source);
@@ -643,6 +654,8 @@ static esp_err_t lecturas_get(httpd_req_t *r) {
     const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "device_id", device_id);
+    cJSON_AddNumberToObject(root, "boot_id", g_boot_id);
+    cJSON_AddNumberToObject(root, "current_uptime_s", (double)(esp_timer_get_time() / 1000000ULL));
     cJSON_AddBoolToObject(root, "valid", g_last_readings.valid);
     cJSON_AddNumberToObject(root, "window_s", g_last_readings.window_s);
 
@@ -652,6 +665,10 @@ static esp_err_t lecturas_get(httpd_req_t *r) {
     } else {
         cJSON_AddNumberToObject(root, "id", g_last_readings.measurement_id);
         cJSON_AddNumberToObject(root, "measurement_id", g_last_readings.measurement_id);
+        cJSON_AddNumberToObject(root, "boot_id", g_last_readings.boot_id);
+        cJSON_AddNumberToObject(root, "uptime_s", g_last_readings.uptime_s);
+        cJSON_AddBoolToObject(root, "time_valid", g_last_readings.time_valid);
+        cJSON_AddStringToObject(root, "time_source", g_last_readings.time_valid ? "esp" : "pending_estimate");
         if (g_last_readings.timestamp[0]) {
             cJSON_AddStringToObject(root, "timestamp", g_last_readings.timestamp);
         } else {
@@ -704,6 +721,8 @@ static esp_err_t lecturas_since_get(httpd_req_t *r) {
     cJSON_AddBoolToObject(root, "sd_ready", sd_store_is_ready());
     cJSON_AddNumberToObject(root, "after_id", after_id);
     cJSON_AddNumberToObject(root, "last_id", sd_store_last_id());
+    cJSON_AddNumberToObject(root, "boot_id", g_boot_id);
+    cJSON_AddNumberToObject(root, "current_uptime_s", (double)(esp_timer_get_time() / 1000000ULL));
     cJSON_AddNumberToObject(root, "count", added);
     cJSON_AddItemToObject(root, "rows", rows);
 
