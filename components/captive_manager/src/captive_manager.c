@@ -40,6 +40,21 @@ static char g_last_sync_source[16] = "none";
 static int  g_connect_attempts = 0;
 static int64_t g_boot_time_ms = 0;
 static captive_manager_readings_t g_last_readings = {0};
+static captive_manager_sensor_debug_t g_sensor_debug = {0};
+
+#define DEBUG_EVENT_COUNT 24
+#define DEBUG_EVENT_NAME_LEN 32
+#define DEBUG_EVENT_DETAIL_LEN 120
+
+typedef struct {
+    uint32_t uptime_s;
+    char event[DEBUG_EVENT_NAME_LEN];
+    char detail[DEBUG_EVENT_DETAIL_LEN];
+} debug_event_t;
+
+static debug_event_t g_debug_events[DEBUG_EVENT_COUNT] = {0};
+static uint32_t g_debug_event_next = 0;
+static uint32_t g_debug_event_total = 0;
 
 static void restart_later_task(void *arg) {
     vTaskDelay(pdMS_TO_TICKS(800));
@@ -62,6 +77,8 @@ static esp_err_t apply_device_time(const char *date, const char *time_text);
 static void load_saved_device_time(void);
 static void get_active_ip_string(char *buf, size_t buf_size);
 static void get_current_datetime_string(char *buf, size_t buf_size);
+static void add_readings_to_json(cJSON *root, const captive_manager_readings_t *readings);
+static void add_diagnostics_common(cJSON *root);
 
 const char* captive_manager_state_str(captive_state_t st) {
     switch(st){
@@ -83,6 +100,9 @@ captive_state_t captive_manager_get_state(void){
 
 static void set_state(captive_state_t st) {
     if (g_state != st) {
+        char detail[96];
+        snprintf(detail, sizeof(detail), "%s->%s", captive_manager_state_str(g_state), captive_manager_state_str(st));
+        captive_manager_record_debug_event("state", detail);
         ESP_LOGI(TAG, "STATE: %s -> %s", captive_manager_state_str(g_state), captive_manager_state_str(st));
         g_state = st;
     }
@@ -102,6 +122,25 @@ void captive_manager_set_last_readings(const captive_manager_readings_t *reading
         return;
     }
     g_last_readings = *readings;
+}
+
+void captive_manager_update_sensor_debug(const captive_manager_sensor_debug_t *debug) {
+    if (!debug) {
+        memset(&g_sensor_debug, 0, sizeof(g_sensor_debug));
+        return;
+    }
+    g_sensor_debug = *debug;
+}
+
+void captive_manager_record_debug_event(const char *event, const char *detail) {
+    uint32_t idx = g_debug_event_next % DEBUG_EVENT_COUNT;
+    g_debug_events[idx].uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    snprintf(g_debug_events[idx].event, sizeof(g_debug_events[idx].event), "%s", event ? event : "event");
+    snprintf(g_debug_events[idx].detail, sizeof(g_debug_events[idx].detail), "%s", detail ? detail : "");
+    g_debug_event_next = (g_debug_event_next + 1) % DEBUG_EVENT_COUNT;
+    if (g_debug_event_total < DEBUG_EVENT_COUNT) {
+        g_debug_event_total++;
+    }
 }
 
 bool captive_manager_time_is_valid(void) {
@@ -163,6 +202,7 @@ static esp_err_t apply_device_time(const char *date, const char *time_text) {
     snprintf(g_config_time, sizeof(g_config_time), "%s", time_text);
     g_time_valid = true;
     snprintf(g_last_sync_source, sizeof(g_last_sync_source), "server");
+    captive_manager_record_debug_event("time_sync", "server configured time");
 
     device_time_cfg_t cfg = {0};
     cfg.valid = true;
@@ -332,6 +372,7 @@ static void connect_sta(const char *ssid, const char *pass, bool from_saved) {
 }
 
 void captive_manager_notify_sta_got_ip(void) {
+    captive_manager_record_debug_event("wifi_got_ip", "STA connected");
     g_sta_have_ip = true;
     g_connect_attempts = 0;
     shutdown_ap_http();
@@ -344,6 +385,9 @@ void captive_manager_notify_sta_got_ip(void) {
 }
 
 void captive_manager_notify_sta_disconnected(int reason_code) {
+    char detail[96];
+    snprintf(detail, sizeof(detail), "reason=%d state=%s attempts=%d", reason_code, captive_manager_state_str(g_state), g_connect_attempts);
+    captive_manager_record_debug_event("wifi_disconnected", detail);
     ESP_LOGW(TAG, "STA disconnected (reason=%d) state=%s saved=%d attempts=%d",
              reason_code, captive_manager_state_str(g_state), g_using_saved, g_connect_attempts);
     g_sta_have_ip = false;
@@ -599,6 +643,96 @@ static esp_err_t scan_get(httpd_req_t *r) {
     return ESP_OK;
 }
 
+static void add_readings_to_json(cJSON *root, const captive_manager_readings_t *readings) {
+    if (!root || !readings) return;
+    cJSON_AddBoolToObject(root, "valid", readings->valid);
+    cJSON_AddNumberToObject(root, "id", readings->measurement_id);
+    cJSON_AddNumberToObject(root, "measurement_id", readings->measurement_id);
+    cJSON_AddNumberToObject(root, "boot_id", readings->boot_id);
+    cJSON_AddNumberToObject(root, "uptime_s", readings->uptime_s);
+    cJSON_AddNumberToObject(root, "window_s", readings->window_s);
+    cJSON_AddBoolToObject(root, "time_valid", readings->time_valid);
+    cJSON_AddStringToObject(root, "time_source", readings->time_valid ? "esp" : "pending_estimate");
+    if (readings->timestamp[0]) {
+        cJSON_AddStringToObject(root, "timestamp", readings->timestamp);
+    } else {
+        cJSON_AddNullToObject(root, "timestamp");
+    }
+    cJSON_AddNumberToObject(root, "co2", readings->co2);
+    cJSON_AddNumberToObject(root, "pm1p0", readings->pm1p0);
+    cJSON_AddNumberToObject(root, "pm2p5", readings->pm2p5);
+    cJSON_AddNumberToObject(root, "pm4p0", readings->pm4p0);
+    cJSON_AddNumberToObject(root, "pm10p0", readings->pm10p0);
+    cJSON_AddNumberToObject(root, "voc", readings->voc);
+    cJSON_AddNumberToObject(root, "nox", readings->nox);
+    cJSON_AddNumberToObject(root, "temp", readings->temp);
+    cJSON_AddNumberToObject(root, "hum", readings->hum);
+}
+
+static void add_diagnostics_common(cJSON *root) {
+    const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
+    char mdns_name[64];
+    char ip_buf[32];
+    snprintf(mdns_name, sizeof(mdns_name), "%s.local", device_id);
+    get_active_ip_string(ip_buf, sizeof(ip_buf));
+
+    cJSON_AddStringToObject(root, "device_id", device_id);
+    cJSON_AddStringToObject(root, "firmware", "ESP32-WROVER-EcoSensor-MicroSD");
+    cJSON_AddStringToObject(root, "debug_schema", "2026-05-18");
+    cJSON_AddStringToObject(root, "ip", ip_buf);
+    cJSON_AddStringToObject(root, "mdns", mdns_name);
+    cJSON_AddStringToObject(root, "state", captive_manager_state_str(g_state));
+    cJSON_AddBoolToObject(root, "sta_have_ip", g_sta_have_ip);
+    cJSON_AddBoolToObject(root, "using_saved", g_using_saved);
+    cJSON_AddNumberToObject(root, "conn_attempts", g_connect_attempts);
+    cJSON_AddBoolToObject(root, "sd_ready", sd_store_is_ready());
+    cJSON_AddNumberToObject(root, "sd_last_id", sd_store_last_id());
+    cJSON_AddNumberToObject(root, "boot_id", g_boot_id);
+    cJSON_AddNumberToObject(root, "current_uptime_s", (double)(esp_timer_get_time() / 1000000ULL));
+    cJSON_AddBoolToObject(root, "time_valid", g_time_valid);
+    cJSON_AddBoolToObject(root, "needs_time_sync", !g_time_valid);
+    cJSON_AddStringToObject(root, "last_sync_source", g_last_sync_source);
+    if (g_time_valid) {
+        char current_datetime[32];
+        get_current_datetime_string(current_datetime, sizeof(current_datetime));
+        cJSON_AddStringToObject(root, "current_datetime", current_datetime);
+    } else {
+        cJSON_AddNullToObject(root, "current_datetime");
+    }
+
+    cJSON *sensor = cJSON_CreateObject();
+    cJSON_AddNumberToObject(sensor, "sample_slot", g_sensor_debug.sample_slot);
+    cJSON_AddNumberToObject(sensor, "samples_per_window", g_sensor_debug.samples_per_window);
+    cJSON_AddNumberToObject(sensor, "scd40_ok_count", g_sensor_debug.scd40_ok_count);
+    cJSON_AddNumberToObject(sensor, "sen55_ok_count", g_sensor_debug.sen55_ok_count);
+    cJSON_AddNumberToObject(sensor, "voc_nox_ok_count", g_sensor_debug.voc_nox_ok_count);
+    cJSON_AddBoolToObject(sensor, "voc_nox_ready", g_sensor_debug.voc_nox_ready);
+    cJSON_AddNumberToObject(sensor, "scd40_ret", g_sensor_debug.scd40_ret);
+    cJSON_AddNumberToObject(sensor, "sen55_ret", g_sensor_debug.sen55_ret);
+    cJSON_AddNumberToObject(sensor, "scd40_diag", g_sensor_debug.scd40_diag);
+    cJSON_AddNumberToObject(sensor, "sen55_diag", g_sensor_debug.sen55_diag);
+    cJSON_AddNumberToObject(sensor, "last_sample_uptime_s", g_sensor_debug.last_sample_uptime_s);
+    cJSON_AddStringToObject(sensor, "sensors_state", g_sensors_started ? "running" : "waiting");
+    cJSON_AddItemToObject(root, "sensor_debug", sensor);
+
+    cJSON *last = cJSON_CreateObject();
+    add_readings_to_json(last, &g_last_readings);
+    cJSON_AddItemToObject(root, "last_reading", last);
+
+    cJSON *events = cJSON_CreateArray();
+    uint32_t total = g_debug_event_total;
+    uint32_t start = (g_debug_event_next + DEBUG_EVENT_COUNT - total) % DEBUG_EVENT_COUNT;
+    for (uint32_t i = 0; i < total; i++) {
+        uint32_t idx = (start + i) % DEBUG_EVENT_COUNT;
+        cJSON *ev = cJSON_CreateObject();
+        cJSON_AddNumberToObject(ev, "uptime_s", g_debug_events[idx].uptime_s);
+        cJSON_AddStringToObject(ev, "event", g_debug_events[idx].event);
+        cJSON_AddStringToObject(ev, "detail", g_debug_events[idx].detail);
+        cJSON_AddItemToArray(events, ev);
+    }
+    cJSON_AddItemToObject(root, "events", events);
+}
+
 static esp_err_t status_get(httpd_req_t *r) {
     const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
     char mdns_name[64];
@@ -639,6 +773,17 @@ static esp_err_t status_get(httpd_req_t *r) {
         }
     }
     cJSON_AddStringToObject(root, "sensors", g_sensors_started ? "running" : "waiting");
+    cJSON_AddNumberToObject(root, "last_measurement_id", g_last_readings.measurement_id);
+    cJSON_AddNumberToObject(root, "last_measurement_uptime_s", g_last_readings.uptime_s);
+    if (g_last_readings.timestamp[0]) {
+        cJSON_AddStringToObject(root, "last_measurement_timestamp", g_last_readings.timestamp);
+    } else {
+        cJSON_AddNullToObject(root, "last_measurement_timestamp");
+    }
+    cJSON_AddBoolToObject(root, "last_measurement_time_valid", g_last_readings.time_valid);
+    cJSON_AddNumberToObject(root, "last_sample_uptime_s", g_sensor_debug.last_sample_uptime_s);
+    cJSON_AddNumberToObject(root, "scd40_diag", g_sensor_debug.scd40_diag);
+    cJSON_AddNumberToObject(root, "sen55_diag", g_sensor_debug.sen55_diag);
     cJSON_AddStringToObject(root, "state", captive_manager_state_str(g_state));
     cJSON_AddBoolToObject(root, "using_saved", g_using_saved);
     cJSON_AddNumberToObject(root, "conn_attempts", g_connect_attempts);
@@ -725,6 +870,19 @@ static esp_err_t lecturas_since_get(httpd_req_t *r) {
     cJSON_AddNumberToObject(root, "current_uptime_s", (double)(esp_timer_get_time() / 1000000ULL));
     cJSON_AddNumberToObject(root, "count", added);
     cJSON_AddItemToObject(root, "rows", rows);
+
+    char *out = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_sendstr(r, out);
+    free(out);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t diagnostics_get(httpd_req_t *r) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    add_diagnostics_common(root);
 
     char *out = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(r, "application/json");
@@ -823,6 +981,8 @@ static httpd_uri_t uri_save             = { .uri="/save",        .method=HTTP_PO
 static httpd_uri_t uri_status           = { .uri="/status",      .method=HTTP_GET,    .handler=status_get };
 static httpd_uri_t uri_lecturas         = { .uri="/lecturas",    .method=HTTP_GET,    .handler=lecturas_get };
 static httpd_uri_t uri_lecturas_since   = { .uri="/lecturas/since", .method=HTTP_GET,  .handler=lecturas_since_get };
+static httpd_uri_t uri_diagnostics      = { .uri="/diagnostics", .method=HTTP_GET,    .handler=diagnostics_get };
+static httpd_uri_t uri_debug            = { .uri="/debug",       .method=HTTP_GET,    .handler=diagnostics_get };
 static httpd_uri_t uri_config           = { .uri="/config",      .method=HTTP_POST,   .handler=config_post };
 static httpd_uri_t uri_time             = { .uri="/time",        .method=HTTP_POST,   .handler=config_post };
 static httpd_uri_t uri_wifi_clr         = { .uri="/wifi/clear",  .method=HTTP_DELETE, .handler=wifi_clear_delete };
@@ -835,7 +995,7 @@ static esp_err_t start_http(void) {
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.max_open_sockets = 2;
-    cfg.max_uri_handlers = 16;
+    cfg.max_uri_handlers = 18;
     cfg.stack_size = 8192;
     cfg.lru_purge_enable = true;
 
@@ -847,6 +1007,8 @@ static esp_err_t start_http(void) {
         httpd_register_uri_handler(g_server, &uri_status);
         httpd_register_uri_handler(g_server, &uri_lecturas);
         httpd_register_uri_handler(g_server, &uri_lecturas_since);
+        httpd_register_uri_handler(g_server, &uri_diagnostics);
+        httpd_register_uri_handler(g_server, &uri_debug);
         httpd_register_uri_handler(g_server, &uri_config);
         httpd_register_uri_handler(g_server, &uri_time);
         httpd_register_uri_handler(g_server, &uri_wifi_clr);

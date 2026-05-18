@@ -89,8 +89,14 @@ static void publish_latest_average(const SensorData *avg) {
     if (sd_ret == ESP_OK) {
         snapshot.id = measurement_id;
         snapshot.measurement_id = measurement_id;
+        char detail[96];
+        snprintf(detail, sizeof(detail), "id=%lu time_valid=%s", (unsigned long)measurement_id, snapshot.time_valid ? "true" : "false");
+        captive_manager_record_debug_event("measurement_saved", detail);
         ESP_LOGI(TAG, "Medicion publicada y guardada en SD con id=%lu", (unsigned long)measurement_id);
     } else {
+        char detail[96];
+        snprintf(detail, sizeof(detail), "sd_ret=%s", esp_err_to_name(sd_ret));
+        captive_manager_record_debug_event("measurement_not_saved", detail);
         ESP_LOGW(TAG, "Medicion publicada SIN guardar en SD: %s", esp_err_to_name(sd_ret));
     }
 
@@ -136,15 +142,14 @@ static void sensor_task(void *pv) {
 
         esp_err_t sen_ret = sensors_read_sen55(&data);
         int sen_diag = sensors_get_last_sen55_diag();
+        bool voc_nox_ready_now = (xTaskGetTickCount() - sensor_start_tick) >= voc_nox_warmup_ticks;
         if (sen_ret == ESP_OK) {
             sum_pm1p0 += data.pm1p0;
             sum_pm2p5 += data.pm2p5;
             sum_pm4p0 += data.pm4p0;
             sum_pm10p0 += data.pm10p0;
 
-            TickType_t elapsed_ticks = xTaskGetTickCount() - sensor_start_tick;
-            bool voc_nox_ready = elapsed_ticks >= voc_nox_warmup_ticks;
-            if (voc_nox_ready) {
+            if (voc_nox_ready_now) {
                 sum_voc += data.voc;
                 sum_nox += data.nox;
                 voc_nox_ok_count++;
@@ -161,6 +166,21 @@ static void sensor_task(void *pv) {
             sum_avg_hum += data.avg_hum;
             sen55_ok_count++;
         }
+
+        captive_manager_sensor_debug_t debug = {
+            .sample_slot = (uint32_t)(sample_slot + 1),
+            .samples_per_window = SAMPLES_PER_AVG_WINDOW,
+            .scd40_ok_count = (uint32_t)scd40_ok_count,
+            .sen55_ok_count = (uint32_t)sen55_ok_count,
+            .voc_nox_ok_count = (uint32_t)voc_nox_ok_count,
+            .voc_nox_ready = voc_nox_ready_now,
+            .scd40_ret = (int)scd_ret,
+            .sen55_ret = (int)sen_ret,
+            .scd40_diag = scd_diag,
+            .sen55_diag = sen_diag,
+            .last_sample_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL),
+        };
+        captive_manager_update_sensor_debug(&debug);
 
 #if LOG_EACH_SAMPLE
         ESP_LOGI(TAG,
@@ -248,11 +268,15 @@ static void sensor_start_task(void *pv) {
 
             esp_err_t sret = sensors_init_all();
             if (sret != ESP_OK) {
+                char detail[96];
+                snprintf(detail, sizeof(detail), "sensors_init=%s", esp_err_to_name(sret));
+                captive_manager_record_debug_event("sensors_init_failed", detail);
                 ESP_LOGE(TAG, "Fallo al inicializar sensores: %s", esp_err_to_name(sret));
                 vTaskDelay(pdMS_TO_TICKS(5000));
                 continue;
             }
 
+            captive_manager_record_debug_event("sensors_init_ok", "starting sensor_task");
             xTaskCreate(sensor_task, "sensor_task", SENSOR_TASK_STACK, NULL, 5, &s_sensor_task_handle);
             s_sensors_started = true;
             captive_manager_set_sensors_started(true);
@@ -290,7 +314,12 @@ void app_main(void)
 
     esp_err_t sd_ret = sd_store_init();
     if (sd_ret != ESP_OK) {
+        char detail[96];
+        snprintf(detail, sizeof(detail), "sd_init=%s", esp_err_to_name(sd_ret));
+        captive_manager_record_debug_event("sd_init_failed", detail);
         ESP_LOGW(TAG, "SD no disponible; lecturas solo en memoria hasta resolver SD: %s", esp_err_to_name(sd_ret));
+    } else {
+        captive_manager_record_debug_event("sd_init_ok", "sd ready");
     }
 
     ESP_LOGI(TAG, "WiFi manager iniciado");

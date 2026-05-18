@@ -48,6 +48,20 @@ typedef struct {
     float hum;
 } captive_manager_readings_t;
 
+typedef struct {
+    uint32_t sample_slot;
+    uint32_t samples_per_window;
+    uint32_t scd40_ok_count;
+    uint32_t sen55_ok_count;
+    uint32_t voc_nox_ok_count;
+    bool voc_nox_ready;
+    int scd40_ret;
+    int sen55_ret;
+    int scd40_diag;
+    int sen55_diag;
+    uint32_t last_sample_uptime_s;
+} captive_manager_sensor_debug_t;
+
 esp_err_t captive_manager_init(const captive_manager_cfg_t *cfg);
 esp_err_t captive_manager_start(void);
 
@@ -61,6 +75,8 @@ esp_err_t captive_manager_enter_recaptive(void);
 bool captive_manager_using_saved(void);
 void captive_manager_set_sensors_started(bool started);
 void captive_manager_set_last_readings(const captive_manager_readings_t *readings);
+void captive_manager_update_sensor_debug(const captive_manager_sensor_debug_t *debug);
+void captive_manager_record_debug_event(const char *event, const char *detail);
 bool captive_manager_time_is_valid(void);
 uint32_t captive_manager_boot_id(void);
 
