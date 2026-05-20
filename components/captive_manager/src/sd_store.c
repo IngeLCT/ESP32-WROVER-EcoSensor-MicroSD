@@ -3,6 +3,7 @@
 #include "driver/gpio.h"
 #include "driver/sdspi_host.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include "freertos/FreeRTOS.h"
@@ -378,15 +379,66 @@ static bool parse_csv_line(const char *line, sd_store_row_t *row) {
     return false;
 }
 
-esp_err_t sd_store_add_readings_since(cJSON *array, uint32_t after_id, uint32_t limit, uint32_t *added) {
+static void add_row_json(cJSON *array, const sd_store_row_t *parsed) {
+    cJSON *row = cJSON_CreateObject();
+    cJSON_AddNumberToObject(row, "id", parsed->id);
+    cJSON_AddNumberToObject(row, "measurement_id", parsed->id);
+    cJSON_AddNumberToObject(row, "boot_id", parsed->boot_id);
+    cJSON_AddNumberToObject(row, "uptime_s", parsed->uptime_s);
+    cJSON_AddBoolToObject(row, "time_valid", parsed->time_valid);
+    cJSON_AddStringToObject(row, "time_source", parsed->time_valid ? "esp" : "pending_estimate");
+    if (parsed->timestamp[0]) {
+        cJSON_AddStringToObject(row, "timestamp", parsed->timestamp);
+    } else {
+        cJSON_AddNullToObject(row, "timestamp");
+    }
+    cJSON_AddNumberToObject(row, "co2", parsed->co2);
+    cJSON_AddNumberToObject(row, "pm1p0", parsed->pm1p0);
+    cJSON_AddNumberToObject(row, "pm2p5", parsed->pm2p5);
+    cJSON_AddNumberToObject(row, "pm4p0", parsed->pm4p0);
+    cJSON_AddNumberToObject(row, "pm10p0", parsed->pm10p0);
+    cJSON_AddNumberToObject(row, "voc", parsed->voc);
+    cJSON_AddNumberToObject(row, "nox", parsed->nox);
+    cJSON_AddNumberToObject(row, "temp", parsed->temp);
+    cJSON_AddNumberToObject(row, "hum", parsed->hum);
+    cJSON_AddNumberToObject(row, "window_s", parsed->window_s);
+    cJSON_AddItemToArray(array, row);
+}
+
+static uint32_t normalize_limit(uint32_t limit) {
+    if (limit == 0) {
+        return 25;
+    }
+    if (limit > 100) {
+        return 100;
+    }
+    return limit;
+}
+
+static uint32_t normalize_timeout_ms(uint32_t timeout_ms) {
+    if (timeout_ms == 0) {
+        return 1200;
+    }
+    if (timeout_ms > 3000) {
+        return 3000;
+    }
+    return timeout_ms;
+}
+
+static bool scan_timed_out(int64_t started_us, uint32_t timeout_ms) {
+    return (esp_timer_get_time() - started_us) > ((int64_t)timeout_ms * 1000LL);
+}
+
+esp_err_t sd_store_add_readings_since(cJSON *array, uint32_t after_id, uint32_t limit, uint32_t timeout_ms, uint32_t *added, uint32_t *scanned) {
     if (!g_ready || !array) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (limit == 0 || limit > 1000) {
-        limit = 500;
-    }
+    limit = normalize_limit(limit);
+    timeout_ms = normalize_timeout_ms(timeout_ms);
 
-    if (g_lock) xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_lock && xSemaphoreTake(g_lock, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
     FILE *f = fopen(CSV_PATH, "r");
     if (!f) {
         if (g_lock) xSemaphoreGive(g_lock);
@@ -395,38 +447,24 @@ esp_err_t sd_store_add_readings_since(cJSON *array, uint32_t after_id, uint32_t 
 
     char line[320];
     uint32_t count = 0;
+    uint32_t scanned_rows = 0;
+    esp_err_t result = ESP_OK;
+    int64_t started_us = esp_timer_get_time();
     while (fgets(line, sizeof(line), f) && count < limit) {
+        if ((scanned_rows & 0x0F) == 0 && scan_timed_out(started_us, timeout_ms)) {
+            result = ESP_ERR_TIMEOUT;
+            break;
+        }
         sd_store_row_t parsed = {0};
         if (!parse_csv_line(line, &parsed)) {
             continue;
         }
+        scanned_rows++;
         if (parsed.id <= after_id) {
             continue;
         }
 
-        cJSON *row = cJSON_CreateObject();
-        cJSON_AddNumberToObject(row, "id", parsed.id);
-        cJSON_AddNumberToObject(row, "measurement_id", parsed.id);
-        cJSON_AddNumberToObject(row, "boot_id", parsed.boot_id);
-        cJSON_AddNumberToObject(row, "uptime_s", parsed.uptime_s);
-        cJSON_AddBoolToObject(row, "time_valid", parsed.time_valid);
-        cJSON_AddStringToObject(row, "time_source", parsed.time_valid ? "esp" : "pending_estimate");
-        if (parsed.timestamp[0]) {
-            cJSON_AddStringToObject(row, "timestamp", parsed.timestamp);
-        } else {
-            cJSON_AddNullToObject(row, "timestamp");
-        }
-        cJSON_AddNumberToObject(row, "co2", parsed.co2);
-        cJSON_AddNumberToObject(row, "pm1p0", parsed.pm1p0);
-        cJSON_AddNumberToObject(row, "pm2p5", parsed.pm2p5);
-        cJSON_AddNumberToObject(row, "pm4p0", parsed.pm4p0);
-        cJSON_AddNumberToObject(row, "pm10p0", parsed.pm10p0);
-        cJSON_AddNumberToObject(row, "voc", parsed.voc);
-        cJSON_AddNumberToObject(row, "nox", parsed.nox);
-        cJSON_AddNumberToObject(row, "temp", parsed.temp);
-        cJSON_AddNumberToObject(row, "hum", parsed.hum);
-        cJSON_AddNumberToObject(row, "window_s", parsed.window_s);
-        cJSON_AddItemToArray(array, row);
+        add_row_json(array, &parsed);
         count++;
     }
     fclose(f);
@@ -435,5 +473,74 @@ esp_err_t sd_store_add_readings_since(cJSON *array, uint32_t after_id, uint32_t 
     if (added) {
         *added = count;
     }
-    return ESP_OK;
+    if (scanned) {
+        *scanned = scanned_rows;
+    }
+    return result;
+}
+
+esp_err_t sd_store_add_recent_readings(cJSON *array, uint32_t after_id, uint32_t before_id, uint32_t limit, uint32_t timeout_ms, uint32_t *added, uint32_t *scanned) {
+    if (!g_ready || !array) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    limit = normalize_limit(limit);
+    timeout_ms = normalize_timeout_ms(timeout_ms);
+
+    sd_store_row_t *ring = calloc(limit, sizeof(sd_store_row_t));
+    if (!ring) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (g_lock && xSemaphoreTake(g_lock, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        free(ring);
+        return ESP_ERR_TIMEOUT;
+    }
+    FILE *f = fopen(CSV_PATH, "r");
+    if (!f) {
+        if (g_lock) xSemaphoreGive(g_lock);
+        free(ring);
+        return ESP_FAIL;
+    }
+
+    char line[320];
+    uint32_t matched = 0;
+    uint32_t scanned_rows = 0;
+    esp_err_t result = ESP_OK;
+    int64_t started_us = esp_timer_get_time();
+    while (fgets(line, sizeof(line), f)) {
+        if ((scanned_rows & 0x0F) == 0 && scan_timed_out(started_us, timeout_ms)) {
+            result = ESP_ERR_TIMEOUT;
+            break;
+        }
+        sd_store_row_t parsed = {0};
+        if (!parse_csv_line(line, &parsed)) {
+            continue;
+        }
+        scanned_rows++;
+        if (parsed.id <= after_id) {
+            continue;
+        }
+        if (before_id > 0 && parsed.id >= before_id) {
+            continue;
+        }
+        ring[matched % limit] = parsed;
+        matched++;
+    }
+    fclose(f);
+    if (g_lock) xSemaphoreGive(g_lock);
+
+    uint32_t count = matched < limit ? matched : limit;
+    uint32_t start = matched > limit ? (matched % limit) : 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        add_row_json(array, &ring[(start + i) % limit]);
+    }
+    free(ring);
+
+    if (added) {
+        *added = count;
+    }
+    if (scanned) {
+        *scanned = scanned_rows;
+    }
+    return result;
 }
