@@ -1,6 +1,7 @@
 #include "captive_manager.h"
 #include "wifi_store.h"
 #include "sd_store.h"
+#include "ota_manager.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -243,6 +244,7 @@ esp_err_t captive_manager_init(const captive_manager_cfg_t *cfg) {
     }
 
     load_saved_device_time();
+    ESP_ERROR_CHECK(ota_manager_init());
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -678,6 +680,7 @@ static void add_diagnostics_common(cJSON *root) {
 
     cJSON_AddStringToObject(root, "device_id", device_id);
     cJSON_AddStringToObject(root, "firmware", "ESP32-WROVER-EcoSensor-MicroSD");
+    cJSON_AddStringToObject(root, "firmware_version", ota_manager_current_version());
     cJSON_AddStringToObject(root, "debug_schema", "2026-05-18");
     cJSON_AddStringToObject(root, "ip", ip_buf);
     cJSON_AddStringToObject(root, "mdns", mdns_name);
@@ -749,6 +752,7 @@ static esp_err_t status_get(httpd_req_t *r) {
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "device_id", device_id);
+    cJSON_AddStringToObject(root, "firmware_version", ota_manager_current_version());
     cJSON_AddStringToObject(root, "wifi", wifi);
     cJSON_AddStringToObject(root, "ip", ip_buf);
     cJSON_AddStringToObject(root, "mdns", mdns_name);
@@ -1049,6 +1053,86 @@ static esp_err_t config_post(httpd_req_t *r) {
     return ESP_OK;
 }
 
+static esp_err_t ota_status_get(httpd_req_t *r) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "device_id", (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor");
+    ota_manager_add_status_json(root);
+    char *out = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_sendstr(r, out);
+    free(out);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t ota_update_post(httpd_req_t *r) {
+    if (!g_sta_have_ip) {
+        return httpd_resp_send_err(r, 409, "network not ready");
+    }
+    if (ota_manager_busy()) {
+        return httpd_resp_send_err(r, 409, "ota already in progress");
+    }
+    if (r->content_len <= 0 || r->content_len >= 768) {
+        return httpd_resp_send_err(r, 400, "invalid payload size");
+    }
+
+    char buf[768];
+    int total = 0;
+    while (total < r->content_len && total < (int)sizeof(buf) - 1) {
+        int received = httpd_req_recv(r, buf + total, r->content_len - total);
+        if (received <= 0) {
+            return httpd_resp_send_err(r, 400, "payload read failed");
+        }
+        total += received;
+    }
+    buf[total] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        return httpd_resp_send_err(r, 400, "json");
+    }
+    cJSON *j_device_id = cJSON_GetObjectItem(root, "device_id");
+    cJSON *j_version = cJSON_GetObjectItem(root, "version");
+    cJSON *j_url = cJSON_GetObjectItem(root, "firmware_url");
+    cJSON *j_sha = cJSON_GetObjectItem(root, "sha256");
+    if (!cJSON_IsString(j_device_id) || !cJSON_IsString(j_version) || !cJSON_IsString(j_url)) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(r, 400, "device_id/version/firmware_url required");
+    }
+
+    const char *expected_device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
+    if (strcmp(j_device_id->valuestring, expected_device_id) != 0) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(r, 400, "device_id mismatch");
+    }
+
+    esp_err_t err = ota_manager_start(
+        j_device_id->valuestring,
+        j_version->valuestring,
+        j_url->valuestring,
+        cJSON_IsString(j_sha) ? j_sha->valuestring : ""
+    );
+    cJSON_Delete(root);
+    if (err == ESP_ERR_INVALID_STATE) {
+        return httpd_resp_send_err(r, 409, "ota already in progress");
+    }
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(r, 400, esp_err_to_name(err));
+    }
+
+    cJSON *out = cJSON_CreateObject();
+    cJSON_AddBoolToObject(out, "ok", true);
+    cJSON_AddStringToObject(out, "state", "queued");
+    cJSON_AddStringToObject(out, "device_id", expected_device_id);
+    cJSON_AddStringToObject(out, "current_version", ota_manager_current_version());
+    char *text = cJSON_PrintUnformatted(out);
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_sendstr(r, text);
+    free(text);
+    cJSON_Delete(out);
+    return ESP_OK;
+}
+
 static httpd_uri_t uri_favicon          = { .uri="/favicon.ico", .method=HTTP_GET,    .handler=favicon_get };
 static httpd_uri_t uri_root             = { .uri="/",            .method=HTTP_GET,    .handler=root_get };
 static httpd_uri_t uri_scan             = { .uri="/scan",        .method=HTTP_GET,    .handler=scan_get };
@@ -1065,13 +1149,15 @@ static httpd_uri_t uri_wifi_clr         = { .uri="/wifi/clear",  .method=HTTP_DE
 static httpd_uri_t uri_wifi_clr_get     = { .uri="/wifi/clear",  .method=HTTP_GET,    .handler=wifi_clear_get };
 static httpd_uri_t uri_readings_clr     = { .uri="/lecturas/clear", .method=HTTP_DELETE, .handler=readings_clear_delete };
 static httpd_uri_t uri_readings_clr_get = { .uri="/lecturas/clear", .method=HTTP_GET,    .handler=readings_clear_get };
+static httpd_uri_t uri_ota_update       = { .uri="/ota/update", .method=HTTP_POST, .handler=ota_update_post };
+static httpd_uri_t uri_ota_status       = { .uri="/ota/status", .method=HTTP_GET, .handler=ota_status_get };
 
 static esp_err_t start_http(void) {
     if (g_server) return ESP_OK;
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.max_open_sockets = 2;
-    cfg.max_uri_handlers = 18;
+    cfg.max_uri_handlers = 20;
     cfg.stack_size = 8192;
     cfg.lru_purge_enable = true;
 
@@ -1092,6 +1178,8 @@ static esp_err_t start_http(void) {
         httpd_register_uri_handler(g_server, &uri_wifi_clr_get);
         httpd_register_uri_handler(g_server, &uri_readings_clr);
         httpd_register_uri_handler(g_server, &uri_readings_clr_get);
+        httpd_register_uri_handler(g_server, &uri_ota_update);
+        httpd_register_uri_handler(g_server, &uri_ota_status);
         return ESP_OK;
     }
 

@@ -5,6 +5,7 @@
 #include "esp_event.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -294,6 +295,13 @@ static void sensor_start_task(void *pv) {
 
 void app_main(void)
 {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_state = ESP_OTA_IMG_UNDEFINED;
+    if (running && esp_ota_get_state_partition(running, &ota_state) == ESP_OK && ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+        ESP_LOGI(TAG, "Imagen OTA en verificacion; marcando app valida tras arranque minimo");
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_ota_mark_app_valid_cancel_rollback());
+    }
+
     enable_board_peripherals_power();
 
     captive_manager_cfg_t cfg = {
