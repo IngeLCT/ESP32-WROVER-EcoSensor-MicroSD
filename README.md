@@ -16,7 +16,7 @@ El archivo reproducible es `partitions_ota_4mb.csv` y la configuración queda en
 
 ## Versión de firmware
 
-La versión se define en `version.txt`. El firmware la expone como `firmware_version` en:
+La versión se define en el `CMakeLists.txt` raíz con `set(PROJECT_VER "x.y.z")`, igual que en el proyecto GSM. El firmware la expone como `firmware_version` en:
 
 - `GET /status`
 - `GET /diagnostics`
