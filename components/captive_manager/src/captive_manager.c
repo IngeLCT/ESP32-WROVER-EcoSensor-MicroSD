@@ -64,6 +64,7 @@ static void restart_later_task(void *arg) {
 
 static void set_state(captive_state_t st);
 static esp_err_t start_ap(void);
+static esp_err_t start_apsta_with_saved_credentials(void);
 static esp_err_t start_http(void);
 static void scan_start(void);
 static void connect_sta(const char *ssid, const char *pass, bool from_saved);
@@ -311,6 +312,43 @@ static esp_err_t start_ap(void) {
     return ESP_OK;
 }
 
+static esp_err_t start_apsta_with_saved_credentials(void) {
+    char ssid[33] = {0};
+    char pass[65] = {0};
+    esp_err_t err = wifi_store_load(ssid, sizeof(ssid), pass, sizeof(pass));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "No hay credenciales guardadas para reconectar en AP+STA: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    wifi_config_t ap_cfg = {0};
+    snprintf((char*)ap_cfg.ap.ssid, sizeof(ap_cfg.ap.ssid), "%s", g_cfg.ap_ssid);
+    snprintf((char*)ap_cfg.ap.password, sizeof(ap_cfg.ap.password), "%s", g_cfg.ap_pass);
+    ap_cfg.ap.ssid_len = strlen((char*)ap_cfg.ap.ssid);
+    ap_cfg.ap.channel = 1;
+    ap_cfg.ap.authmode = strlen(g_cfg.ap_pass) >= 8 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    ap_cfg.ap.max_connection = 4;
+    ap_cfg.ap.beacon_interval = 100;
+
+    wifi_config_t sta_cfg = {0};
+    strlcpy((char*)sta_cfg.sta.ssid, ssid, sizeof(sta_cfg.sta.ssid));
+    strlcpy((char*)sta_cfg.sta.password, pass, sizeof(sta_cfg.sta.password));
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    ESP_ERROR_CHECK(apply_saved_sta_ip_config());
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+
+    g_sta_have_ip = false;
+    g_using_saved = true;
+    set_state(CAP_STATE_CONNECTING);
+    ESP_LOGI(TAG, "AP+STA activo: AP=%s, reintentando red guardada SSID=%s", ap_cfg.ap.ssid, sta_cfg.sta.ssid);
+    ESP_ERROR_CHECK(esp_wifi_connect());
+    start_mdns_service();
+    return ESP_OK;
+}
+
 static esp_err_t parse_ipv4_or_fail(const char *text, esp_ip4_addr_t *out) {
     if (!text || !out || !ip4addr_aton(text, (ip4_addr_t *)out)) {
         return ESP_ERR_INVALID_ARG;
@@ -405,7 +443,7 @@ void captive_manager_notify_sta_disconnected(int reason_code) {
             return;
         }
 
-        ESP_LOGW(TAG, "Sin conexión tras reintentos. Volviendo al Wi-Fi manager");
+        ESP_LOGW(TAG, "Sin conexión tras reintentos. Activando AP y manteniendo reconexión STA con credenciales guardadas");
         captive_manager_enter_recaptive();
     }
 }
@@ -415,16 +453,21 @@ esp_err_t captive_manager_enter_recaptive(void) {
     shutdown_ap_http();
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_disconnect());
     g_sta_have_ip = false;
-    g_using_saved = false;
     g_connect_attempts = 0;
 
-    set_state(CAP_STATE_RECAPTIVE);
-    ESP_ERROR_CHECK(start_ap());
+    if (wifi_store_has_credentials() && start_apsta_with_saved_credentials() == ESP_OK) {
+        captive_manager_record_debug_event("wifi_manager_apsta", "AP enabled; STA keeps retrying saved network");
+    } else {
+        g_using_saved = false;
+        set_state(CAP_STATE_RECAPTIVE);
+        ESP_ERROR_CHECK(start_ap());
+        set_state(CAP_STATE_SCAN);
+        scan_start();
+    }
+
     if (!g_server) {
         ESP_ERROR_CHECK(start_http());
     }
-    set_state(CAP_STATE_SCAN);
-    scan_start();
     return ESP_OK;
 }
 

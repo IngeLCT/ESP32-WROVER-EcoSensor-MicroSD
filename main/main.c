@@ -16,8 +16,8 @@
 
 static const char *TAG = "EcoSensor";
 
-static const char *MDNS_HOSTNAME = "ecosensor01";
-static const char *AP_SSID = "EcoSensor-01";
+static const char *MDNS_HOSTNAME = "ecosensor03";
+static const char *AP_SSID = "EcoSensor-03";
 static const char *AP_PASS = "LCT3180940";
 
 #define LOG_EACH_SAMPLE          1
