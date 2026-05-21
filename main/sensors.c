@@ -2,10 +2,12 @@
 #include "driver/i2c_master.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 
 #define I2C_MASTER_SCL_IO       19
 #define I2C_MASTER_SDA_IO       18
@@ -28,6 +30,7 @@ static const char *TAG_SENS = "SENSORS";
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
 static i2c_master_dev_handle_t s_scd4x_dev = NULL;
 static i2c_master_dev_handle_t s_sen5x_dev = NULL;
+static SemaphoreHandle_t s_scd40_lock = NULL;
 
 static int s_last_scd40_diag = SENSOR_DIAG_OK;
 static int s_last_sen55_diag = SENSOR_DIAG_OK;
@@ -106,6 +109,21 @@ void sensors_reset_diag(void) {
     scd40_set_error("OK");
 }
 
+static void scd40_result_init(captive_manager_scd40_action_result_t *out, const char *action) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->action, sizeof(out->action), "%s", action ? action : "unknown");
+    snprintf(out->message, sizeof(out->message), "pending");
+    snprintf(out->variant, sizeof(out->variant), "UNKNOWN");
+}
+
+static void scd40_result_finish(captive_manager_scd40_action_result_t *out, esp_err_t ret, const char *message) {
+    if (!out) return;
+    out->ret = (int)ret;
+    out->ok = (ret == ESP_OK);
+    snprintf(out->message, sizeof(out->message), "%s", message ? message : esp_err_to_name(ret));
+}
+
 static uint8_t sensirion_crc8(const uint8_t *data, int len) {
     uint8_t crc = 0xFF;
     for (int i = 0; i < len; i++) {
@@ -118,9 +136,112 @@ static uint8_t sensirion_crc8(const uint8_t *data, int len) {
     return crc;
 }
 
+static esp_err_t scd4x_send_cmd(uint16_t cmd_value, uint32_t delay_ms) {
+    uint8_t cmd[2] = {(uint8_t)(cmd_value >> 8), (uint8_t)(cmd_value & 0xFF)};
+    esp_err_t ret = i2c_master_transmit(s_scd4x_dev, cmd, sizeof(cmd), pdMS_TO_TICKS(1000));
+    if (delay_ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+    return ret;
+}
+
 static esp_err_t scd4x_start_measurement(void) {
-    uint8_t cmd[2] = {0x21, 0xB1};
-    return i2c_master_transmit(s_scd4x_dev, cmd, sizeof(cmd), pdMS_TO_TICKS(1000));
+    return scd4x_send_cmd(0x21B1, 0);
+}
+
+static esp_err_t scd4x_stop_measurement(void) {
+    return scd4x_send_cmd(0x3F86, 500);
+}
+
+static esp_err_t scd4x_read_words(uint16_t cmd_value, uint32_t delay_ms, uint16_t *words, size_t word_count) {
+    if (!words || word_count == 0) return ESP_ERR_INVALID_ARG;
+    esp_err_t ret = scd4x_send_cmd(cmd_value, delay_ms);
+    if (ret != ESP_OK) return ret;
+
+    uint8_t data[9] = {0};
+    size_t rx_len = word_count * 3;
+    if (rx_len > sizeof(data)) return ESP_ERR_INVALID_ARG;
+    ret = i2c_master_receive(s_scd4x_dev, data, rx_len, pdMS_TO_TICKS(1000));
+    if (ret != ESP_OK) return ret;
+
+    for (size_t i = 0; i < word_count; i++) {
+        const uint8_t *chunk = &data[i * 3];
+        if (sensirion_crc8(chunk, 2) != chunk[2]) {
+            return ESP_ERR_INVALID_CRC;
+        }
+        words[i] = ((uint16_t)chunk[0] << 8) | chunk[1];
+    }
+    return ESP_OK;
+}
+
+static const char *scd4x_variant_name(uint16_t raw) {
+    switch (raw & 0xF000) {
+        case 0x0000: return "SCD40";
+        case 0x1000: return "SCD41";
+        case 0x5000: return "SCD43";
+        default: return "UNKNOWN";
+    }
+}
+
+esp_err_t sensors_scd40_debug_action(const char *action, captive_manager_scd40_action_result_t *out) {
+    const char *selected = (action && action[0]) ? action : "status";
+    scd40_result_init(out, selected);
+    if (!out) return ESP_ERR_INVALID_ARG;
+    if (!s_scd4x_dev) {
+        scd40_result_finish(out, ESP_ERR_INVALID_STATE, "SCD40 no inicializado");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_scd40_lock) xSemaphoreTake(s_scd40_lock, portMAX_DELAY);
+
+    esp_err_t ret = ESP_OK;
+    if (strcmp(selected, "restart") == 0) {
+        ret = scd4x_stop_measurement();
+        if (ret == ESP_OK) ret = scd4x_start_measurement();
+        scd40_result_finish(out, ret, ret == ESP_OK ? "periodic measurement reiniciada; esperar ~5s para nueva muestra" : esp_err_to_name(ret));
+    } else if (strcmp(selected, "reinit") == 0) {
+        ret = scd4x_stop_measurement();
+        if (ret == ESP_OK) ret = scd4x_send_cmd(0x3646, 30);
+        if (ret == ESP_OK) ret = scd4x_start_measurement();
+        scd40_result_finish(out, ret, ret == ESP_OK ? "sensor reinit ejecutado; esperar ~5s para nueva muestra" : esp_err_to_name(ret));
+    } else if (strcmp(selected, "serial") == 0) {
+        uint16_t words[3] = {0};
+        ret = scd4x_stop_measurement();
+        if (ret == ESP_OK) ret = scd4x_read_words(0x3682, 1, words, 3);
+        esp_err_t start_ret = scd4x_start_measurement();
+        if (ret == ESP_OK) {
+            out->serial_words[0] = words[0];
+            out->serial_words[1] = words[1];
+            out->serial_words[2] = words[2];
+            snprintf(out->serial_hex, sizeof(out->serial_hex), "%04X%04X%04X", words[0], words[1], words[2]);
+        }
+        scd40_result_finish(out, ret == ESP_OK ? start_ret : ret, ret == ESP_OK ? "serial leído" : esp_err_to_name(ret));
+    } else if (strcmp(selected, "selftest") == 0) {
+        uint16_t status = 0xFFFF;
+        ret = scd4x_stop_measurement();
+        if (ret == ESP_OK) ret = scd4x_read_words(0x3639, 10000, &status, 1);
+        esp_err_t start_ret = scd4x_start_measurement();
+        out->self_test_status = status;
+        if (ret == ESP_OK && start_ret != ESP_OK) ret = start_ret;
+        scd40_result_finish(out, ret, ret == ESP_OK ? (status == 0 ? "self-test OK" : "self-test reporta falla") : esp_err_to_name(ret));
+        out->ok = (ret == ESP_OK && status == 0);
+    } else if (strcmp(selected, "variant") == 0) {
+        uint16_t variant = 0;
+        ret = scd4x_stop_measurement();
+        if (ret == ESP_OK) ret = scd4x_read_words(0x202F, 1, &variant, 1);
+        esp_err_t start_ret = scd4x_start_measurement();
+        if (ret == ESP_OK) {
+            out->variant_raw = variant;
+            snprintf(out->variant, sizeof(out->variant), "%s", scd4x_variant_name(variant));
+        }
+        scd40_result_finish(out, ret == ESP_OK ? start_ret : ret, ret == ESP_OK ? "variant leído" : esp_err_to_name(ret));
+    } else {
+        scd40_result_finish(out, ESP_ERR_INVALID_ARG, "acción inválida: use restart|reinit|serial|selftest|variant");
+        ret = ESP_ERR_INVALID_ARG;
+    }
+
+    if (s_scd40_lock) xSemaphoreGive(s_scd40_lock);
+    return ret;
 }
 
 static esp_err_t scd4x_read_measurement(uint16_t *co2, float *temperature, float *humidity) {
@@ -310,6 +431,10 @@ esp_err_t sensors_init_all(void) {
     };
     ret = i2c_master_bus_add_device(s_i2c_bus, &scd_cfg, &s_scd4x_dev);
     if (ret != ESP_OK) return ret;
+    if (!s_scd40_lock) {
+        s_scd40_lock = xSemaphoreCreateMutex();
+        if (!s_scd40_lock) return ESP_ERR_NO_MEM;
+    }
 
     i2c_device_config_t sen_cfg = {
         .device_address = SEN5X_ADDR,
@@ -323,7 +448,9 @@ esp_err_t sensors_init_all(void) {
     vTaskDelay(pdMS_TO_TICKS(100));
     sen5x_start_measurement();
     vTaskDelay(pdMS_TO_TICKS(50));
+    if (s_scd40_lock) xSemaphoreTake(s_scd40_lock, portMAX_DELAY);
     scd4x_start_measurement();
+    if (s_scd40_lock) xSemaphoreGive(s_scd40_lock);
     vTaskDelay(pdMS_TO_TICKS(5000));
 
     sensors_reset_diag();
@@ -337,7 +464,9 @@ esp_err_t sensors_read_scd40(SensorData *out) {
     float temp = 0.0f;
     float hum = 0.0f;
 
+    if (s_scd40_lock) xSemaphoreTake(s_scd40_lock, portMAX_DELAY);
     esp_err_t ret = scd4x_read_measurement(&co2, &temp, &hum);
+    if (s_scd40_lock) xSemaphoreGive(s_scd40_lock);
     out->co2 = co2;
     out->scd_temp = temp;
     out->scd_hum = hum;

@@ -49,6 +49,20 @@ typedef struct {
 } captive_manager_readings_t;
 
 typedef struct {
+    bool ok;
+    int ret;
+    char action[24];
+    char message[96];
+    uint16_t self_test_status;
+    uint16_t serial_words[3];
+    char serial_hex[17];
+    uint16_t variant_raw;
+    char variant[12];
+} captive_manager_scd40_action_result_t;
+
+typedef esp_err_t (*captive_manager_scd40_action_cb_t)(const char *action, captive_manager_scd40_action_result_t *out);
+
+typedef struct {
     uint32_t sample_slot;
     uint32_t samples_per_window;
     uint32_t scd40_ok_count;
@@ -84,6 +98,7 @@ bool captive_manager_using_saved(void);
 void captive_manager_set_sensors_started(bool started);
 void captive_manager_set_last_readings(const captive_manager_readings_t *readings);
 void captive_manager_update_sensor_debug(const captive_manager_sensor_debug_t *debug);
+void captive_manager_set_scd40_action_callback(captive_manager_scd40_action_cb_t cb);
 void captive_manager_record_debug_event(const char *event, const char *detail);
 bool captive_manager_time_is_valid(void);
 uint32_t captive_manager_boot_id(void);

@@ -42,6 +42,7 @@ static int  g_connect_attempts = 0;
 static int64_t g_boot_time_ms = 0;
 static captive_manager_readings_t g_last_readings = {0};
 static captive_manager_sensor_debug_t g_sensor_debug = {0};
+static captive_manager_scd40_action_cb_t g_scd40_action_cb = NULL;
 
 #define DEBUG_EVENT_COUNT 24
 #define DEBUG_EVENT_NAME_LEN 32
@@ -132,6 +133,10 @@ void captive_manager_update_sensor_debug(const captive_manager_sensor_debug_t *d
         return;
     }
     g_sensor_debug = *debug;
+}
+
+void captive_manager_set_scd40_action_callback(captive_manager_scd40_action_cb_t cb) {
+    g_scd40_action_cb = cb;
 }
 
 void captive_manager_record_debug_event(const char *event, const char *detail) {
@@ -1025,6 +1030,23 @@ static esp_err_t diagnostics_get(httpd_req_t *r) {
     return ESP_OK;
 }
 
+static void add_scd40_action_result(cJSON *root, const captive_manager_scd40_action_result_t *result) {
+    if (!root || !result) return;
+    cJSON_AddStringToObject(root, "action", result->action);
+    cJSON_AddBoolToObject(root, "action_ok", result->ok);
+    cJSON_AddNumberToObject(root, "action_ret", result->ret);
+    cJSON_AddStringToObject(root, "action_message", result->message);
+    cJSON_AddNumberToObject(root, "self_test_status", result->self_test_status);
+    cJSON_AddStringToObject(root, "serial_hex", result->serial_hex);
+    cJSON *words = cJSON_CreateArray();
+    for (int i = 0; i < 3; i++) {
+        cJSON_AddItemToArray(words, cJSON_CreateNumber(result->serial_words[i]));
+    }
+    cJSON_AddItemToObject(root, "serial_words", words);
+    cJSON_AddNumberToObject(root, "variant_raw", result->variant_raw);
+    cJSON_AddStringToObject(root, "variant", result->variant);
+}
+
 static esp_err_t scd40_debug_get(httpd_req_t *r) {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "ok", true);
@@ -1047,6 +1069,23 @@ static esp_err_t scd40_debug_get(httpd_req_t *r) {
     cJSON_AddNumberToObject(root, "last_hum", g_sensor_debug.scd40_last_hum);
     cJSON_AddStringToObject(root, "raw_bytes", g_sensor_debug.scd40_raw_bytes);
     cJSON_AddNumberToObject(root, "last_sample_uptime_s", g_sensor_debug.last_sample_uptime_s);
+
+    char query[96] = {0};
+    char action[24] = "status";
+    if (httpd_req_get_url_query_str(r, query, sizeof(query)) == ESP_OK) {
+        (void)httpd_query_key_value(query, "action", action, sizeof(action));
+    }
+    if (strcmp(action, "status") != 0) {
+        captive_manager_scd40_action_result_t result = {0};
+        if (g_scd40_action_cb) {
+            esp_err_t ret = g_scd40_action_cb(action, &result);
+            (void)ret;
+            add_scd40_action_result(root, &result);
+        } else {
+            cJSON_AddBoolToObject(root, "action_ok", false);
+            cJSON_AddStringToObject(root, "action_message", "callback SCD40 no registrado");
+        }
+    }
 
     char *out = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(r, "application/json");

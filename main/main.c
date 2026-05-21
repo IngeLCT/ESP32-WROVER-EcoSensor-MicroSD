@@ -330,6 +330,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &wifi_event_handler, NULL));
     captive_manager_set_sensors_started(false);
+    captive_manager_set_scd40_action_callback(sensors_scd40_debug_action);
     ESP_ERROR_CHECK(captive_manager_start());
 
     esp_err_t sd_ret = sd_store_init();

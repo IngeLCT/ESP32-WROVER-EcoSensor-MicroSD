@@ -1,5 +1,6 @@
 #pragma once
 #include "esp_err.h"
+#include "captive_manager.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -54,4 +55,5 @@ float sensors_get_last_scd40_temp(void);
 float sensors_get_last_scd40_hum(void);
 const char *sensors_get_last_scd40_raw_bytes(void);
 const char *sensors_get_last_scd40_error(void);
+esp_err_t sensors_scd40_debug_action(const char *action, captive_manager_scd40_action_result_t *out);
 void sensors_reset_diag(void);
