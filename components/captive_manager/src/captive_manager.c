@@ -750,6 +750,7 @@ static void add_diagnostics_common(cJSON *root) {
     cJSON_AddNumberToObject(sensor, "sample_slot", g_sensor_debug.sample_slot);
     cJSON_AddNumberToObject(sensor, "samples_per_window", g_sensor_debug.samples_per_window);
     cJSON_AddNumberToObject(sensor, "scd40_ok_count", g_sensor_debug.scd40_ok_count);
+    cJSON_AddNumberToObject(sensor, "scd40_error_count", g_sensor_debug.scd40_error_count);
     cJSON_AddNumberToObject(sensor, "sen55_ok_count", g_sensor_debug.sen55_ok_count);
     cJSON_AddNumberToObject(sensor, "voc_nox_ok_count", g_sensor_debug.voc_nox_ok_count);
     cJSON_AddBoolToObject(sensor, "voc_nox_ready", g_sensor_debug.voc_nox_ready);
@@ -757,6 +758,13 @@ static void add_diagnostics_common(cJSON *root) {
     cJSON_AddNumberToObject(sensor, "sen55_ret", g_sensor_debug.sen55_ret);
     cJSON_AddNumberToObject(sensor, "scd40_diag", g_sensor_debug.scd40_diag);
     cJSON_AddNumberToObject(sensor, "sen55_diag", g_sensor_debug.sen55_diag);
+    cJSON_AddNumberToObject(sensor, "scd40_raw_co2", g_sensor_debug.scd40_raw_co2);
+    cJSON_AddNumberToObject(sensor, "scd40_raw_temp", g_sensor_debug.scd40_raw_temp);
+    cJSON_AddNumberToObject(sensor, "scd40_raw_hum", g_sensor_debug.scd40_raw_hum);
+    cJSON_AddNumberToObject(sensor, "scd40_last_temp", g_sensor_debug.scd40_last_temp);
+    cJSON_AddNumberToObject(sensor, "scd40_last_hum", g_sensor_debug.scd40_last_hum);
+    cJSON_AddStringToObject(sensor, "scd40_raw_bytes", g_sensor_debug.scd40_raw_bytes);
+    cJSON_AddStringToObject(sensor, "scd40_error", g_sensor_debug.scd40_error);
     cJSON_AddNumberToObject(sensor, "last_sample_uptime_s", g_sensor_debug.last_sample_uptime_s);
     cJSON_AddStringToObject(sensor, "sensors_state", g_sensors_started ? "running" : "waiting");
     cJSON_AddItemToObject(root, "sensor_debug", sensor);
@@ -830,6 +838,9 @@ static esp_err_t status_get(httpd_req_t *r) {
     cJSON_AddBoolToObject(root, "last_measurement_time_valid", g_last_readings.time_valid);
     cJSON_AddNumberToObject(root, "last_sample_uptime_s", g_sensor_debug.last_sample_uptime_s);
     cJSON_AddNumberToObject(root, "scd40_diag", g_sensor_debug.scd40_diag);
+    cJSON_AddNumberToObject(root, "scd40_ok_count", g_sensor_debug.scd40_ok_count);
+    cJSON_AddNumberToObject(root, "scd40_error_count", g_sensor_debug.scd40_error_count);
+    cJSON_AddStringToObject(root, "scd40_error", g_sensor_debug.scd40_error);
     cJSON_AddNumberToObject(root, "sen55_diag", g_sensor_debug.sen55_diag);
     cJSON_AddStringToObject(root, "state", captive_manager_state_str(g_state));
     cJSON_AddBoolToObject(root, "using_saved", g_using_saved);
@@ -1014,6 +1025,37 @@ static esp_err_t diagnostics_get(httpd_req_t *r) {
     return ESP_OK;
 }
 
+static esp_err_t scd40_debug_get(httpd_req_t *r) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddStringToObject(root, "endpoint", "/debug/scd40");
+    cJSON_AddStringToObject(root, "device_id", (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor");
+    cJSON_AddNumberToObject(root, "boot_id", g_boot_id);
+    cJSON_AddNumberToObject(root, "current_uptime_s", (double)(esp_timer_get_time() / 1000000ULL));
+    cJSON_AddStringToObject(root, "sensors_state", g_sensors_started ? "running" : "waiting");
+    cJSON_AddNumberToObject(root, "sample_slot", g_sensor_debug.sample_slot);
+    cJSON_AddNumberToObject(root, "samples_per_window", g_sensor_debug.samples_per_window);
+    cJSON_AddNumberToObject(root, "scd40_ok_count", g_sensor_debug.scd40_ok_count);
+    cJSON_AddNumberToObject(root, "scd40_error_count", g_sensor_debug.scd40_error_count);
+    cJSON_AddNumberToObject(root, "scd40_ret", g_sensor_debug.scd40_ret);
+    cJSON_AddNumberToObject(root, "scd40_diag", g_sensor_debug.scd40_diag);
+    cJSON_AddStringToObject(root, "scd40_error", g_sensor_debug.scd40_error);
+    cJSON_AddNumberToObject(root, "raw_co2", g_sensor_debug.scd40_raw_co2);
+    cJSON_AddNumberToObject(root, "raw_temp", g_sensor_debug.scd40_raw_temp);
+    cJSON_AddNumberToObject(root, "raw_hum", g_sensor_debug.scd40_raw_hum);
+    cJSON_AddNumberToObject(root, "last_temp", g_sensor_debug.scd40_last_temp);
+    cJSON_AddNumberToObject(root, "last_hum", g_sensor_debug.scd40_last_hum);
+    cJSON_AddStringToObject(root, "raw_bytes", g_sensor_debug.scd40_raw_bytes);
+    cJSON_AddNumberToObject(root, "last_sample_uptime_s", g_sensor_debug.last_sample_uptime_s);
+
+    char *out = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_sendstr(r, out);
+    free(out);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
 static esp_err_t wifi_clear_delete(httpd_req_t *r) {
     httpd_resp_set_type(r, "text/plain");
     httpd_resp_sendstr(r, "Credenciales Wi-Fi borradas. El dispositivo se reiniciará en segundos.");
@@ -1186,6 +1228,7 @@ static httpd_uri_t uri_lecturas_since   = { .uri="/lecturas/since", .method=HTTP
 static httpd_uri_t uri_lecturas_recent  = { .uri="/lecturas/recent", .method=HTTP_GET, .handler=lecturas_recent_get };
 static httpd_uri_t uri_diagnostics      = { .uri="/diagnostics", .method=HTTP_GET,    .handler=diagnostics_get };
 static httpd_uri_t uri_debug            = { .uri="/debug",       .method=HTTP_GET,    .handler=diagnostics_get };
+static httpd_uri_t uri_debug_scd40      = { .uri="/debug/scd40", .method=HTTP_GET,    .handler=scd40_debug_get };
 static httpd_uri_t uri_config           = { .uri="/config",      .method=HTTP_POST,   .handler=config_post };
 static httpd_uri_t uri_time             = { .uri="/time",        .method=HTTP_POST,   .handler=config_post };
 static httpd_uri_t uri_wifi_clr         = { .uri="/wifi/clear",  .method=HTTP_DELETE, .handler=wifi_clear_delete };
@@ -1215,6 +1258,7 @@ static esp_err_t start_http(void) {
         httpd_register_uri_handler(g_server, &uri_lecturas_recent);
         httpd_register_uri_handler(g_server, &uri_diagnostics);
         httpd_register_uri_handler(g_server, &uri_debug);
+        httpd_register_uri_handler(g_server, &uri_debug_scd40);
         httpd_register_uri_handler(g_server, &uri_config);
         httpd_register_uri_handler(g_server, &uri_time);
         httpd_register_uri_handler(g_server, &uri_wifi_clr);

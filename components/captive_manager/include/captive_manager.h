@@ -52,6 +52,7 @@ typedef struct {
     uint32_t sample_slot;
     uint32_t samples_per_window;
     uint32_t scd40_ok_count;
+    uint32_t scd40_error_count;
     uint32_t sen55_ok_count;
     uint32_t voc_nox_ok_count;
     bool voc_nox_ready;
@@ -59,6 +60,13 @@ typedef struct {
     int sen55_ret;
     int scd40_diag;
     int sen55_diag;
+    uint16_t scd40_raw_co2;
+    uint16_t scd40_raw_temp;
+    uint16_t scd40_raw_hum;
+    float scd40_last_temp;
+    float scd40_last_hum;
+    char scd40_raw_bytes[28];
+    char scd40_error[24];
     uint32_t last_sample_uptime_s;
 } captive_manager_sensor_debug_t;
 

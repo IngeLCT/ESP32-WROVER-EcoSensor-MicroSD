@@ -16,8 +16,8 @@
 
 static const char *TAG = "EcoSensor";
 
-static const char *MDNS_HOSTNAME = "ecosensor03";
-static const char *AP_SSID = "EcoSensor-03";
+static const char *MDNS_HOSTNAME = "ecosensor02";
+static const char *AP_SSID = "EcoSensor-02";
 static const char *AP_PASS = "LCT3180940";
 
 #define LOG_EACH_SAMPLE          1
@@ -112,6 +112,7 @@ static void sensor_task(void *pv) {
     int sample_slot = 0;
     uint32_t sum_co2 = 0;
     int scd40_ok_count = 0;
+    int scd40_error_count = 0;
     int sen55_ok_count = 0;
     int voc_nox_ok_count = 0;
     bool voc_nox_warmup_logged = false;
@@ -139,6 +140,8 @@ static void sensor_task(void *pv) {
             sum_scd_temp += data.scd_temp;
             sum_scd_hum += data.scd_hum;
             scd40_ok_count++;
+        } else {
+            scd40_error_count++;
         }
 
         esp_err_t sen_ret = sensors_read_sen55(&data);
@@ -172,6 +175,7 @@ static void sensor_task(void *pv) {
             .sample_slot = (uint32_t)(sample_slot + 1),
             .samples_per_window = SAMPLES_PER_AVG_WINDOW,
             .scd40_ok_count = (uint32_t)scd40_ok_count,
+            .scd40_error_count = (uint32_t)scd40_error_count,
             .sen55_ok_count = (uint32_t)sen55_ok_count,
             .voc_nox_ok_count = (uint32_t)voc_nox_ok_count,
             .voc_nox_ready = voc_nox_ready_now,
@@ -179,8 +183,15 @@ static void sensor_task(void *pv) {
             .sen55_ret = (int)sen_ret,
             .scd40_diag = scd_diag,
             .sen55_diag = sen_diag,
+            .scd40_raw_co2 = sensors_get_last_scd40_raw_co2(),
+            .scd40_raw_temp = sensors_get_last_scd40_raw_temp(),
+            .scd40_raw_hum = sensors_get_last_scd40_raw_hum(),
+            .scd40_last_temp = sensors_get_last_scd40_temp(),
+            .scd40_last_hum = sensors_get_last_scd40_hum(),
             .last_sample_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL),
         };
+        snprintf(debug.scd40_raw_bytes, sizeof(debug.scd40_raw_bytes), "%s", sensors_get_last_scd40_raw_bytes());
+        snprintf(debug.scd40_error, sizeof(debug.scd40_error), "%s", sensors_get_last_scd40_error());
         captive_manager_update_sensor_debug(&debug);
 
 #if LOG_EACH_SAMPLE
@@ -239,6 +250,7 @@ static void sensor_task(void *pv) {
             sample_slot = 0;
             sum_co2 = 0;
             scd40_ok_count = 0;
+            scd40_error_count = 0;
             sen55_ok_count = 0;
             voc_nox_ok_count = 0;
             sum_pm1p0 = 0;

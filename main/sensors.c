@@ -31,6 +31,13 @@ static i2c_master_dev_handle_t s_sen5x_dev = NULL;
 
 static int s_last_scd40_diag = SENSOR_DIAG_OK;
 static int s_last_sen55_diag = SENSOR_DIAG_OK;
+static uint16_t s_last_scd40_raw_co2 = 0;
+static uint16_t s_last_scd40_raw_temp = 0;
+static uint16_t s_last_scd40_raw_hum = 0;
+static float s_last_scd40_temp = 0.0f;
+static float s_last_scd40_hum = 0.0f;
+static char s_last_scd40_raw_bytes[28] = "";
+static char s_last_scd40_error[24] = "OK";
 
 static int map_i2c_err_to_diag(esp_err_t err, bool is_rx_stage) {
     if (err == ESP_OK) return SENSOR_DIAG_OK;
@@ -38,6 +45,23 @@ static int map_i2c_err_to_diag(esp_err_t err, bool is_rx_stage) {
     if (err == ESP_ERR_TIMEOUT) return SENSOR_DIAG_TIMEOUT;
     if (err == ESP_ERR_INVALID_RESPONSE) return SENSOR_DIAG_OUT_OF_RANGE;
     return is_rx_stage ? SENSOR_DIAG_I2C_RX : SENSOR_DIAG_I2C_TX;
+}
+
+static void scd40_set_error(const char *text) {
+    snprintf(s_last_scd40_error, sizeof(s_last_scd40_error), "%s", text ? text : "UNKNOWN");
+}
+
+static void scd40_store_raw_bytes(const uint8_t *data, size_t len) {
+    if (!data || len == 0) {
+        s_last_scd40_raw_bytes[0] = '\0';
+        return;
+    }
+    size_t pos = 0;
+    for (size_t i = 0; i < len && pos + 3 < sizeof(s_last_scd40_raw_bytes); i++) {
+        int written = snprintf(&s_last_scd40_raw_bytes[pos], sizeof(s_last_scd40_raw_bytes) - pos, "%02X%s", data[i], (i + 1 < len) ? " " : "");
+        if (written <= 0) break;
+        pos += (size_t)written;
+    }
 }
 
 int sensors_get_last_scd40_diag(void) {
@@ -48,9 +72,38 @@ int sensors_get_last_sen55_diag(void) {
     return s_last_sen55_diag;
 }
 
+uint16_t sensors_get_last_scd40_raw_co2(void) {
+    return s_last_scd40_raw_co2;
+}
+
+uint16_t sensors_get_last_scd40_raw_temp(void) {
+    return s_last_scd40_raw_temp;
+}
+
+uint16_t sensors_get_last_scd40_raw_hum(void) {
+    return s_last_scd40_raw_hum;
+}
+
+float sensors_get_last_scd40_temp(void) {
+    return s_last_scd40_temp;
+}
+
+float sensors_get_last_scd40_hum(void) {
+    return s_last_scd40_hum;
+}
+
+const char *sensors_get_last_scd40_raw_bytes(void) {
+    return s_last_scd40_raw_bytes;
+}
+
+const char *sensors_get_last_scd40_error(void) {
+    return s_last_scd40_error;
+}
+
 void sensors_reset_diag(void) {
     s_last_scd40_diag = SENSOR_DIAG_OK;
     s_last_sen55_diag = SENSOR_DIAG_OK;
+    scd40_set_error("OK");
 }
 
 static uint8_t sensirion_crc8(const uint8_t *data, int len) {
@@ -72,11 +125,13 @@ static esp_err_t scd4x_start_measurement(void) {
 
 static esp_err_t scd4x_read_measurement(uint16_t *co2, float *temperature, float *humidity) {
     s_last_scd40_diag = SENSOR_DIAG_OK;
+    scd40_set_error("OK");
 
     uint8_t cmd[2] = {0xEC, 0x05};
     esp_err_t ret = i2c_master_transmit(s_scd4x_dev, cmd, sizeof(cmd), pdMS_TO_TICKS(1000));
     if (ret != ESP_OK) {
         s_last_scd40_diag = map_i2c_err_to_diag(ret, false);
+        scd40_set_error("I2C_TX");
         return ret;
     }
 
@@ -86,21 +141,40 @@ static esp_err_t scd4x_read_measurement(uint16_t *co2, float *temperature, float
     ret = i2c_master_receive(s_scd4x_dev, data, sizeof(data), pdMS_TO_TICKS(1000));
     if (ret != ESP_OK) {
         s_last_scd40_diag = map_i2c_err_to_diag(ret, true);
+        scd40_set_error(ret == ESP_ERR_TIMEOUT ? "TIMEOUT" : "I2C_RX");
         return ret;
     }
+    scd40_store_raw_bytes(data, sizeof(data));
 
     if (sensirion_crc8(&data[0], 2) != data[2] ||
         sensirion_crc8(&data[3], 2) != data[5] ||
         sensirion_crc8(&data[6], 2) != data[8]) {
-        ESP_LOGW(TAG_SENS, "SCD40 CRC invalido");
+        ESP_LOGW(TAG_SENS, "SCD40 CRC invalido raw=%s", s_last_scd40_raw_bytes);
         s_last_scd40_diag = SENSOR_DIAG_CRC;
+        scd40_set_error("CRC_INVALIDO");
         return ESP_ERR_INVALID_CRC;
     }
 
     *co2 = ((uint16_t)data[0] << 8) | data[1];
-    if (*co2 < SCD40_CO2_OUTPUT_MIN || *co2 > SCD40_CO2_OUTPUT_MAX) {
-        ESP_LOGW(TAG_SENS, "SCD40 CO2 fuera de rango fisico: %u ppm", *co2);
-        s_last_scd40_diag = SENSOR_DIAG_OUT_OF_RANGE;
+    uint16_t raw_temp = ((uint16_t)data[3] << 8) | data[4];
+    uint16_t raw_hum  = ((uint16_t)data[6] << 8) | data[7];
+    s_last_scd40_raw_co2 = *co2;
+    s_last_scd40_raw_temp = raw_temp;
+    s_last_scd40_raw_hum = raw_hum;
+    s_last_scd40_temp = -45.0f + 175.0f * ((float)raw_temp / 65535.0f);
+    s_last_scd40_hum = 100.0f * ((float)raw_hum / 65535.0f);
+
+    if (*co2 == 0) {
+        ESP_LOGW(TAG_SENS, "SCD40 CO2 cero raw=%s temp=%.2f hum=%.2f", s_last_scd40_raw_bytes, s_last_scd40_temp, s_last_scd40_hum);
+        s_last_scd40_diag = SENSOR_DIAG_CO2_ZERO;
+        scd40_set_error("CO2_ZERO");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    if (*co2 > SCD40_CO2_OUTPUT_MAX) {
+        ESP_LOGW(TAG_SENS, "SCD40 CO2 demasiado alto: %u ppm raw=%s", *co2, s_last_scd40_raw_bytes);
+        s_last_scd40_diag = SENSOR_DIAG_CO2_TOO_HIGH;
+        scd40_set_error("CO2_TOO_HIGH");
         return ESP_ERR_INVALID_RESPONSE;
     }
 
@@ -112,13 +186,11 @@ static esp_err_t scd4x_read_measurement(uint16_t *co2, float *temperature, float
                  *co2);
     }
 
-    uint16_t raw_temp = ((uint16_t)data[3] << 8) | data[4];
-    uint16_t raw_hum  = ((uint16_t)data[6] << 8) | data[7];
-
-    *temperature = -45.0f + 175.0f * ((float)raw_temp / 65535.0f);
-    *humidity    = 100.0f * ((float)raw_hum / 65535.0f);
+    *temperature = s_last_scd40_temp;
+    *humidity    = s_last_scd40_hum;
 
     s_last_scd40_diag = SENSOR_DIAG_OK;
+    scd40_set_error("OK");
     return ESP_OK;
 }
 
