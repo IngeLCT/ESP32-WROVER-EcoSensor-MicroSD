@@ -18,7 +18,7 @@
 static const char *TAG = "sd_store";
 static const char *MOUNT_POINT = "/sdcard";
 static const char *CSV_PATH = "/sdcard/data.csv";
-static const char *CSV_HEADER = "id,boot_id,uptime_s,time_valid,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,window_s\n";
+static const char *CSV_HEADER = "id,boot_id,uptime_s,time_valid,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,scd_temp,scd_hum,sen_temp,sen_hum,window_s\n";
 
 static bool g_ready = false;
 static uint32_t g_last_id = 0;
@@ -192,7 +192,7 @@ esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uin
     if (g_lock) xSemaphoreTake(g_lock, portMAX_DELAY);
     uint32_t id = ++g_last_id;
     ESP_LOGI(TAG,
-             "Guardando medicion SD id=%lu boot_id=%lu uptime_s=%lu time_valid=%s timestamp=%s co2=%u pm2.5=%.2f voc=%.2f nox=%.2f temp=%.2f hum=%.2f window_s=%lu",
+             "Guardando medicion SD id=%lu boot_id=%lu uptime_s=%lu time_valid=%s timestamp=%s co2=%u pm2.5=%.2f voc=%.2f nox=%.2f temp=%.2f hum=%.2f scd=%.2f/%.2f sen=%.2f/%.2f window_s=%lu",
              (unsigned long)id,
              (unsigned long)reading->boot_id,
              (unsigned long)reading->uptime_s,
@@ -204,6 +204,10 @@ esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uin
              reading->nox,
              reading->temp,
              reading->hum,
+             reading->scd_temp,
+             reading->scd_hum,
+             reading->sen_temp,
+             reading->sen_hum,
              (unsigned long)reading->window_s);
 
     FILE *f = fopen(CSV_PATH, "a");
@@ -215,7 +219,7 @@ esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uin
     }
 
     int written = fprintf(f,
-                          "%lu,%lu,%lu,%u,%s,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%lu\n",
+                          "%lu,%lu,%lu,%u,%s,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%lu\n",
                           (unsigned long)id,
                           (unsigned long)reading->boot_id,
                           (unsigned long)reading->uptime_s,
@@ -230,6 +234,10 @@ esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uin
                           reading->nox,
                           reading->temp,
                           reading->hum,
+                          reading->scd_temp,
+                          reading->scd_hum,
+                          reading->sen_temp,
+                          reading->sen_hum,
                           (unsigned long)reading->window_s);
     if (written < 0) {
         ESP_LOGE(TAG, "fprintf fallo al escribir medicion id=%lu: errno=%d (%s)", (unsigned long)id, errno, strerror(errno));
@@ -278,6 +286,10 @@ typedef struct {
     float nox;
     float temp;
     float hum;
+    float scd_temp;
+    float scd_hum;
+    float sen_temp;
+    float sen_hum;
     uint32_t window_s;
 } sd_store_row_t;
 
@@ -339,9 +351,9 @@ static bool parse_csv_line(const char *line, sd_store_row_t *row) {
     int n = split_csv_simple(copy, fields, 20);
     memset(row, 0, sizeof(*row));
 
-    // Formato nuevo:
-    // id,boot_id,uptime_s,time_valid,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,window_s
-    if (n >= 15 && parse_u32_field(fields[0], &row->id) && parse_u32_field(fields[1], &row->boot_id)) {
+    // Formato nuevo extendido:
+    // id,boot_id,uptime_s,time_valid,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,scd_temp,scd_hum,sen_temp,sen_hum,window_s
+    if (n >= 19 && parse_u32_field(fields[0], &row->id) && parse_u32_field(fields[1], &row->boot_id)) {
         uint32_t time_valid = 0;
         return parse_u32_field(fields[2], &row->uptime_s) &&
                parse_u32_field(fields[3], &time_valid) &&
@@ -356,7 +368,38 @@ static bool parse_csv_line(const char *line, sd_store_row_t *row) {
                parse_float_field(fields[11], &row->nox) &&
                parse_float_field(fields[12], &row->temp) &&
                parse_float_field(fields[13], &row->hum) &&
+               parse_float_field(fields[14], &row->scd_temp) &&
+               parse_float_field(fields[15], &row->scd_hum) &&
+               parse_float_field(fields[16], &row->sen_temp) &&
+               parse_float_field(fields[17], &row->sen_hum) &&
+               parse_u32_field(fields[18], &row->window_s);
+    }
+
+    // Formato nuevo anterior:
+    // id,boot_id,uptime_s,time_valid,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,window_s
+    if (n >= 15 && parse_u32_field(fields[0], &row->id) && parse_u32_field(fields[1], &row->boot_id)) {
+        uint32_t time_valid = 0;
+        bool ok = parse_u32_field(fields[2], &row->uptime_s) &&
+               parse_u32_field(fields[3], &time_valid) &&
+               (row->time_valid = time_valid != 0, true) &&
+               (snprintf(row->timestamp, sizeof(row->timestamp), "%s", fields[4] ? fields[4] : ""), true) &&
+               parse_u32_field(fields[5], &row->co2) &&
+               parse_float_field(fields[6], &row->pm1p0) &&
+               parse_float_field(fields[7], &row->pm2p5) &&
+               parse_float_field(fields[8], &row->pm4p0) &&
+               parse_float_field(fields[9], &row->pm10p0) &&
+               parse_float_field(fields[10], &row->voc) &&
+               parse_float_field(fields[11], &row->nox) &&
+               parse_float_field(fields[12], &row->temp) &&
+               parse_float_field(fields[13], &row->hum) &&
                parse_u32_field(fields[14], &row->window_s);
+        if (ok) {
+            row->scd_temp = row->temp;
+            row->scd_hum = row->hum;
+            row->sen_temp = row->temp;
+            row->sen_hum = row->hum;
+        }
+        return ok;
     }
 
     // Compatibilidad con formato anterior:
@@ -364,7 +407,7 @@ static bool parse_csv_line(const char *line, sd_store_row_t *row) {
     if (n >= 12 && parse_u32_field(fields[0], &row->id)) {
         row->time_valid = fields[1] && fields[1][0] != '\0';
         snprintf(row->timestamp, sizeof(row->timestamp), "%s", fields[1] ? fields[1] : "");
-        return parse_u32_field(fields[2], &row->co2) &&
+        bool ok = parse_u32_field(fields[2], &row->co2) &&
                parse_float_field(fields[3], &row->pm1p0) &&
                parse_float_field(fields[4], &row->pm2p5) &&
                parse_float_field(fields[5], &row->pm4p0) &&
@@ -374,6 +417,13 @@ static bool parse_csv_line(const char *line, sd_store_row_t *row) {
                parse_float_field(fields[9], &row->temp) &&
                parse_float_field(fields[10], &row->hum) &&
                parse_u32_field(fields[11], &row->window_s);
+        if (ok) {
+            row->scd_temp = row->temp;
+            row->scd_hum = row->hum;
+            row->sen_temp = row->temp;
+            row->sen_hum = row->hum;
+        }
+        return ok;
     }
 
     return false;
@@ -401,6 +451,10 @@ static void add_row_json(cJSON *array, const sd_store_row_t *parsed) {
     cJSON_AddNumberToObject(row, "nox", parsed->nox);
     cJSON_AddNumberToObject(row, "temp", parsed->temp);
     cJSON_AddNumberToObject(row, "hum", parsed->hum);
+    cJSON_AddNumberToObject(row, "scd_temp", parsed->scd_temp);
+    cJSON_AddNumberToObject(row, "scd_hum", parsed->scd_hum);
+    cJSON_AddNumberToObject(row, "sen_temp", parsed->sen_temp);
+    cJSON_AddNumberToObject(row, "sen_hum", parsed->sen_hum);
     cJSON_AddNumberToObject(row, "window_s", parsed->window_s);
     cJSON_AddItemToArray(array, row);
 }

@@ -76,6 +76,10 @@ static void publish_latest_average(const SensorData *avg) {
     snapshot.nox = avg->nox;
     snapshot.temp = avg->avg_temp;
     snapshot.hum = avg->avg_hum;
+    snapshot.scd_temp = avg->scd_temp;
+    snapshot.scd_hum = avg->scd_hum;
+    snapshot.sen_temp = avg->sen_temp;
+    snapshot.sen_hum = avg->sen_hum;
 
     snapshot.time_valid = captive_manager_time_is_valid();
     if (snapshot.time_valid) {
@@ -188,6 +192,8 @@ static void sensor_task(void *pv) {
             .scd40_raw_hum = sensors_get_last_scd40_raw_hum(),
             .scd40_last_temp = sensors_get_last_scd40_temp(),
             .scd40_last_hum = sensors_get_last_scd40_hum(),
+            .sen55_last_temp = sensors_get_last_sen55_temp(),
+            .sen55_last_hum = sensors_get_last_sen55_hum(),
             .last_sample_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL),
         };
         snprintf(debug.scd40_raw_bytes, sizeof(debug.scd40_raw_bytes), "%s", sensors_get_last_scd40_raw_bytes());

@@ -53,6 +53,8 @@ uint16_t sensors_get_last_scd40_raw_temp(void);
 uint16_t sensors_get_last_scd40_raw_hum(void);
 float sensors_get_last_scd40_temp(void);
 float sensors_get_last_scd40_hum(void);
+float sensors_get_last_sen55_temp(void);
+float sensors_get_last_sen55_hum(void);
 const char *sensors_get_last_scd40_raw_bytes(void);
 const char *sensors_get_last_scd40_error(void);
 esp_err_t sensors_scd40_debug_action(const char *action, captive_manager_scd40_action_result_t *out);

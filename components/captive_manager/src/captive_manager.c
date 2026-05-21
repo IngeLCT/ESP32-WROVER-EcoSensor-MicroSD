@@ -717,6 +717,10 @@ static void add_readings_to_json(cJSON *root, const captive_manager_readings_t *
     cJSON_AddNumberToObject(root, "nox", readings->nox);
     cJSON_AddNumberToObject(root, "temp", readings->temp);
     cJSON_AddNumberToObject(root, "hum", readings->hum);
+    cJSON_AddNumberToObject(root, "scd_temp", readings->scd_temp);
+    cJSON_AddNumberToObject(root, "scd_hum", readings->scd_hum);
+    cJSON_AddNumberToObject(root, "sen_temp", readings->sen_temp);
+    cJSON_AddNumberToObject(root, "sen_hum", readings->sen_hum);
 }
 
 static void add_diagnostics_common(cJSON *root) {
@@ -768,6 +772,8 @@ static void add_diagnostics_common(cJSON *root) {
     cJSON_AddNumberToObject(sensor, "scd40_raw_hum", g_sensor_debug.scd40_raw_hum);
     cJSON_AddNumberToObject(sensor, "scd40_last_temp", g_sensor_debug.scd40_last_temp);
     cJSON_AddNumberToObject(sensor, "scd40_last_hum", g_sensor_debug.scd40_last_hum);
+    cJSON_AddNumberToObject(sensor, "sen55_last_temp", g_sensor_debug.sen55_last_temp);
+    cJSON_AddNumberToObject(sensor, "sen55_last_hum", g_sensor_debug.sen55_last_hum);
     cJSON_AddStringToObject(sensor, "scd40_raw_bytes", g_sensor_debug.scd40_raw_bytes);
     cJSON_AddStringToObject(sensor, "scd40_error", g_sensor_debug.scd40_error);
     cJSON_AddNumberToObject(sensor, "last_sample_uptime_s", g_sensor_debug.last_sample_uptime_s);

@@ -46,6 +46,10 @@ typedef struct {
     float nox;
     float temp;
     float hum;
+    float scd_temp;
+    float scd_hum;
+    float sen_temp;
+    float sen_hum;
 } captive_manager_readings_t;
 
 typedef struct {
@@ -79,6 +83,8 @@ typedef struct {
     uint16_t scd40_raw_hum;
     float scd40_last_temp;
     float scd40_last_hum;
+    float sen55_last_temp;
+    float sen55_last_hum;
     char scd40_raw_bytes[28];
     char scd40_error[24];
     uint32_t last_sample_uptime_s;

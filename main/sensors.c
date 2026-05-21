@@ -39,6 +39,8 @@ static uint16_t s_last_scd40_raw_temp = 0;
 static uint16_t s_last_scd40_raw_hum = 0;
 static float s_last_scd40_temp = 0.0f;
 static float s_last_scd40_hum = 0.0f;
+static float s_last_sen55_temp = 0.0f;
+static float s_last_sen55_hum = 0.0f;
 static char s_last_scd40_raw_bytes[28] = "";
 static char s_last_scd40_error[24] = "OK";
 
@@ -93,6 +95,14 @@ float sensors_get_last_scd40_temp(void) {
 
 float sensors_get_last_scd40_hum(void) {
     return s_last_scd40_hum;
+}
+
+float sensors_get_last_sen55_temp(void) {
+    return s_last_sen55_temp;
+}
+
+float sensors_get_last_sen55_hum(void) {
+    return s_last_sen55_hum;
 }
 
 const char *sensors_get_last_scd40_raw_bytes(void) {
@@ -521,6 +531,8 @@ esp_err_t sensors_read_sen55(SensorData *out) {
     out->nox = nox;
     out->sen_temp = temp;
     out->sen_hum = rh;
+    s_last_sen55_temp = temp;
+    s_last_sen55_hum = rh;
 
     if (out->scd_temp != 0.0f || out->scd_hum != 0.0f) {
         out->avg_temp = (out->scd_temp + temp) / 2.0f;
