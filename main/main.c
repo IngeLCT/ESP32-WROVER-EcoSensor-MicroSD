@@ -17,14 +17,14 @@
 
 static const char *TAG = "EcoSensor";
 
-static const char *MDNS_HOSTNAME = "ecosensor03";
-static const char *AP_SSID = "EcoSensor-03";
+static const char *MDNS_HOSTNAME = "ecosensor02";
+static const char *AP_SSID = "EcoSensor-02";
 static const char *AP_PASS = "LCT3180940";
 
 // Offset SCD40: EcoSensor01: XX EcoSensor02: XX EcoSensor03: 10.70
 // Offset SEN55: EcoSensor01: XX EcoSensor02: XX EcoSensor03: -3.02
-const float ECO_SCD40_TEMP_OFFSET_C = 10.70f;
-const float ECO_SEN55_TEMP_OFFSET_C = -3.02f;
+const float ECO_SCD40_TEMP_OFFSET_C = 0.0f;
+const float ECO_SEN55_TEMP_OFFSET_C = 0.0f;
 
 #define LOG_EACH_SAMPLE          1
 #define SENSOR_TASK_STACK        8192
