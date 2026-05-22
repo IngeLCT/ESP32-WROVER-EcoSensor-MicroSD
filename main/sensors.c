@@ -23,6 +23,7 @@
 #define SCD40_CO2_SPEC_MAX      2000
 
 // Calibración temporal de prueba: aplicar en cada arranque sin persistir EEPROM.
+// ecosensor03 aplica 10.70 C al arrancar y luego lee/reporta el offset actual del SCD40.
 #define SCD40_APPLY_TEMP_OFFSET_ON_BOOT  1
 #define SCD40_BOOT_TEMP_OFFSET_C         10.70f
 
