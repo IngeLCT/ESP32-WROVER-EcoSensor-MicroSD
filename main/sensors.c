@@ -25,12 +25,10 @@
 // Calibración temporal de prueba: aplicar en cada arranque sin persistir EEPROM.
 // ecosensor03 aplica 10.70 C al arrancar y luego lee/reporta el offset actual del SCD40.
 #define SCD40_APPLY_TEMP_OFFSET_ON_BOOT  1
-#define SCD40_BOOT_TEMP_OFFSET_C         10.70f
 
 // Compensación temporal de prueba SEN55: offset simple, sin persistir.
 // Sensirion SEN5x usa escala offset_raw = offset_c * 200.
 #define SEN55_APPLY_TEMP_OFFSET_ON_BOOT  1
-#define SEN55_BOOT_TEMP_OFFSET_C         -3.02f
 #define SEN55_BOOT_TEMP_OFFSET_SLOPE     0
 #define SEN55_BOOT_TEMP_OFFSET_TAU_S     0
 
@@ -669,14 +667,14 @@ esp_err_t sensors_init_all(void) {
     sen5x_device_reset();
     vTaskDelay(pdMS_TO_TICKS(100));
 #if SEN55_APPLY_TEMP_OFFSET_ON_BOOT
-    ret = sen5x_set_temperature_offset(SEN55_BOOT_TEMP_OFFSET_C,
+    ret = sen5x_set_temperature_offset(ECO_SEN55_TEMP_OFFSET_C,
                                        SEN55_BOOT_TEMP_OFFSET_SLOPE,
                                        SEN55_BOOT_TEMP_OFFSET_TAU_S);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG_SENS, "SEN55 temperature_offset temporal aplicado en arranque: %.2f C (no persistido)", SEN55_BOOT_TEMP_OFFSET_C);
+        ESP_LOGI(TAG_SENS, "SEN55 temperature_offset temporal aplicado en arranque: %.2f C (no persistido)", ECO_SEN55_TEMP_OFFSET_C);
         sen5x_cache_temperature_offset();
     } else {
-        ESP_LOGW(TAG_SENS, "No se pudo aplicar temperature_offset temporal SEN55 %.2f C: %s", SEN55_BOOT_TEMP_OFFSET_C, esp_err_to_name(ret));
+        ESP_LOGW(TAG_SENS, "No se pudo aplicar temperature_offset temporal SEN55 %.2f C: %s", ECO_SEN55_TEMP_OFFSET_C, esp_err_to_name(ret));
     }
 #else
     sen5x_cache_temperature_offset();
@@ -686,12 +684,12 @@ esp_err_t sensors_init_all(void) {
     if (s_scd40_lock) xSemaphoreTake(s_scd40_lock, portMAX_DELAY);
     scd4x_cache_temperature_offset();
 #if SCD40_APPLY_TEMP_OFFSET_ON_BOOT
-    ret = scd4x_set_temperature_offset(SCD40_BOOT_TEMP_OFFSET_C);
+    ret = scd4x_set_temperature_offset(ECO_SCD40_TEMP_OFFSET_C);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG_SENS, "SCD40 temperature_offset temporal aplicado en arranque: %.2f C (no persistido)", SCD40_BOOT_TEMP_OFFSET_C);
+        ESP_LOGI(TAG_SENS, "SCD40 temperature_offset temporal aplicado en arranque: %.2f C (no persistido)", ECO_SCD40_TEMP_OFFSET_C);
         scd4x_cache_temperature_offset();
     } else {
-        ESP_LOGW(TAG_SENS, "No se pudo aplicar temperature_offset temporal %.2f C: %s", SCD40_BOOT_TEMP_OFFSET_C, esp_err_to_name(ret));
+        ESP_LOGW(TAG_SENS, "No se pudo aplicar temperature_offset temporal %.2f C: %s", ECO_SCD40_TEMP_OFFSET_C, esp_err_to_name(ret));
     }
 #endif
     scd4x_start_measurement();

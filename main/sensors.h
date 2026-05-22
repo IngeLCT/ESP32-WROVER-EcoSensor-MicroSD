@@ -4,6 +4,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
+extern const float ECO_SCD40_TEMP_OFFSET_C;
+extern const float ECO_SEN55_TEMP_OFFSET_C;
+
 typedef struct {
     // SCD4x
     uint16_t co2;
