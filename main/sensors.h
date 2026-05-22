@@ -35,6 +35,7 @@ typedef enum {
     SENSOR_DIAG_I2C_RX       = 5,
     SENSOR_DIAG_CO2_ZERO     = 6,
     SENSOR_DIAG_CO2_TOO_HIGH = 7,
+    SENSOR_DIAG_NOT_READY    = 8,
     SENSOR_DIAG_OTHER        = 99
 } sensor_diag_code_t;
 
@@ -55,6 +56,7 @@ float sensors_get_last_scd40_temp(void);
 float sensors_get_last_scd40_hum(void);
 float sensors_get_last_sen55_temp(void);
 float sensors_get_last_sen55_hum(void);
+bool sensors_get_scd40_temperature_offset(float *offset_c, uint16_t *raw_offset);
 const char *sensors_get_last_scd40_raw_bytes(void);
 const char *sensors_get_last_scd40_error(void);
 esp_err_t sensors_scd40_debug_action(const char *action, captive_manager_scd40_action_result_t *out);

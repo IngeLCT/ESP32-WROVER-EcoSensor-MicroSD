@@ -43,6 +43,9 @@ static float s_last_sen55_temp = 0.0f;
 static float s_last_sen55_hum = 0.0f;
 static char s_last_scd40_raw_bytes[28] = "";
 static char s_last_scd40_error[24] = "OK";
+static bool s_scd40_temperature_offset_valid = false;
+static uint16_t s_scd40_temperature_offset_raw = 0;
+static float s_scd40_temperature_offset_c = 0.0f;
 
 static int map_i2c_err_to_diag(esp_err_t err, bool is_rx_stage) {
     if (err == ESP_OK) return SENSOR_DIAG_OK;
@@ -103,6 +106,12 @@ float sensors_get_last_sen55_temp(void) {
 
 float sensors_get_last_sen55_hum(void) {
     return s_last_sen55_hum;
+}
+
+bool sensors_get_scd40_temperature_offset(float *offset_c, uint16_t *raw_offset) {
+    if (offset_c) *offset_c = s_scd40_temperature_offset_c;
+    if (raw_offset) *raw_offset = s_scd40_temperature_offset_raw;
+    return s_scd40_temperature_offset_valid;
 }
 
 const char *sensors_get_last_scd40_raw_bytes(void) {
@@ -184,6 +193,31 @@ static esp_err_t scd4x_read_words(uint16_t cmd_value, uint32_t delay_ms, uint16_
     return ESP_OK;
 }
 
+static esp_err_t scd4x_get_data_ready_status(bool *ready, uint16_t *raw_status) {
+    if (!ready) return ESP_ERR_INVALID_ARG;
+    uint16_t status = 0;
+    esp_err_t ret = scd4x_read_words(0xE4B8, 1, &status, 1);
+    if (ret != ESP_OK) return ret;
+    if (raw_status) *raw_status = status;
+    *ready = (status & 0x07FF) != 0;
+    return ESP_OK;
+}
+
+static esp_err_t scd4x_cache_temperature_offset(void) {
+    uint16_t raw_offset = 0;
+    esp_err_t ret = scd4x_read_words(0x2318, 1, &raw_offset, 1);
+    if (ret != ESP_OK) {
+        s_scd40_temperature_offset_valid = false;
+        ESP_LOGW(TAG_SENS, "No se pudo leer temperature_offset SCD40: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    s_scd40_temperature_offset_raw = raw_offset;
+    s_scd40_temperature_offset_c = 175.0f * ((float)raw_offset / 65535.0f);
+    s_scd40_temperature_offset_valid = true;
+    ESP_LOGI(TAG_SENS, "SCD40 temperature_offset=%.3f C raw=%u", s_scd40_temperature_offset_c, raw_offset);
+    return ESP_OK;
+}
+
 static const char *scd4x_variant_name(uint16_t raw) {
     switch (raw & 0xF000) {
         case 0x0000: return "SCD40";
@@ -258,8 +292,23 @@ static esp_err_t scd4x_read_measurement(uint16_t *co2, float *temperature, float
     s_last_scd40_diag = SENSOR_DIAG_OK;
     scd40_set_error("OK");
 
+    bool data_ready = false;
+    uint16_t data_ready_raw = 0;
+    esp_err_t ret = scd4x_get_data_ready_status(&data_ready, &data_ready_raw);
+    if (ret != ESP_OK) {
+        s_last_scd40_diag = map_i2c_err_to_diag(ret, true);
+        scd40_set_error(ret == ESP_ERR_TIMEOUT ? "READY_TIMEOUT" : "READY_READ");
+        return ret;
+    }
+    if (!data_ready) {
+        s_last_scd40_diag = SENSOR_DIAG_NOT_READY;
+        scd40_set_error("NOT_READY");
+        ESP_LOGD(TAG_SENS, "SCD40 data not ready raw_status=0x%04X", data_ready_raw);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     uint8_t cmd[2] = {0xEC, 0x05};
-    esp_err_t ret = i2c_master_transmit(s_scd4x_dev, cmd, sizeof(cmd), pdMS_TO_TICKS(1000));
+    ret = i2c_master_transmit(s_scd4x_dev, cmd, sizeof(cmd), pdMS_TO_TICKS(1000));
     if (ret != ESP_OK) {
         s_last_scd40_diag = map_i2c_err_to_diag(ret, false);
         scd40_set_error("I2C_TX");
@@ -295,6 +344,11 @@ static esp_err_t scd4x_read_measurement(uint16_t *co2, float *temperature, float
     s_last_scd40_temp = -45.0f + 175.0f * ((float)raw_temp / 65535.0f);
     s_last_scd40_hum = 100.0f * ((float)raw_hum / 65535.0f);
 
+    // Aunque CO2 venga inválido, si el frame pasó CRC la temperatura/humedad
+    // del SCD40 siguen siendo útiles para diagnóstico. No las descartes como 0.
+    *temperature = s_last_scd40_temp;
+    *humidity    = s_last_scd40_hum;
+
     if (*co2 == 0) {
         ESP_LOGW(TAG_SENS, "SCD40 CO2 cero raw=%s temp=%.2f hum=%.2f", s_last_scd40_raw_bytes, s_last_scd40_temp, s_last_scd40_hum);
         s_last_scd40_diag = SENSOR_DIAG_CO2_ZERO;
@@ -303,7 +357,7 @@ static esp_err_t scd4x_read_measurement(uint16_t *co2, float *temperature, float
     }
 
     if (*co2 > SCD40_CO2_OUTPUT_MAX) {
-        ESP_LOGW(TAG_SENS, "SCD40 CO2 demasiado alto: %u ppm raw=%s", *co2, s_last_scd40_raw_bytes);
+        ESP_LOGW(TAG_SENS, "SCD40 CO2 demasiado alto: %u ppm raw=%s temp=%.2f hum=%.2f", *co2, s_last_scd40_raw_bytes, s_last_scd40_temp, s_last_scd40_hum);
         s_last_scd40_diag = SENSOR_DIAG_CO2_TOO_HIGH;
         scd40_set_error("CO2_TOO_HIGH");
         return ESP_ERR_INVALID_RESPONSE;
@@ -459,6 +513,7 @@ esp_err_t sensors_init_all(void) {
     sen5x_start_measurement();
     vTaskDelay(pdMS_TO_TICKS(50));
     if (s_scd40_lock) xSemaphoreTake(s_scd40_lock, portMAX_DELAY);
+    scd4x_cache_temperature_offset();
     scd4x_start_measurement();
     if (s_scd40_lock) xSemaphoreGive(s_scd40_lock);
     vTaskDelay(pdMS_TO_TICKS(5000));

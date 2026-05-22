@@ -124,25 +124,34 @@ static void post_temp_hum_debug_sample(const SensorData *data,
         return;
     }
 
-    char payload[384];
+    float scd_offset_c = 0.0f;
+    uint16_t scd_offset_raw = 0;
+    bool scd_offset_valid = sensors_get_scd40_temperature_offset(&scd_offset_c, &scd_offset_raw);
+
+    char payload[512];
     int len = snprintf(payload,
                        sizeof(payload),
                        "{\"device_id\":\"%s\",\"sample_slot\":%d,\"uptime_s\":%lu,"
-                       "\"scd_ret\":%d,\"sen_ret\":%d,"
+                       "\"scd_ret\":%d,\"sen_ret\":%d,\"scd_diag\":%d,"
                        "\"co2\":%u,\"scd_temp\":%.2f,\"scd_hum\":%.2f,"
-                       "\"sen_temp\":%.2f,\"sen_hum\":%.2f,\"avg_temp\":%.2f,\"avg_hum\":%.2f}",
+                       "\"sen_temp\":%.2f,\"sen_hum\":%.2f,\"avg_temp\":%.2f,\"avg_hum\":%.2f,"
+                       "\"scd_temp_offset_valid\":%s,\"scd_temp_offset\":%.3f,\"scd_temp_offset_raw\":%u}",
                        MDNS_HOSTNAME,
                        sample_slot + 1,
                        (unsigned long)(esp_timer_get_time() / 1000000ULL),
                        (int)scd_ret,
                        (int)sen_ret,
+                       sensors_get_last_scd40_diag(),
                        data->co2,
                        data->scd_temp,
                        data->scd_hum,
                        data->sen_temp,
                        data->sen_hum,
                        data->avg_temp,
-                       data->avg_hum);
+                       data->avg_hum,
+                       scd_offset_valid ? "true" : "false",
+                       scd_offset_c,
+                       scd_offset_raw);
     if (len <= 0 || len >= (int)sizeof(payload)) {
         ESP_LOGW(TAG, "Debug temp/hum: payload demasiado grande");
         return;
@@ -182,6 +191,7 @@ static void sensor_task(void *pv) {
     int sample_slot = 0;
     uint32_t sum_co2 = 0;
     int scd40_ok_count = 0;
+    int scd40_temp_hum_count = 0;
     int scd40_error_count = 0;
     int sen55_ok_count = 0;
     int voc_nox_ok_count = 0;
@@ -207,10 +217,15 @@ static void sensor_task(void *pv) {
         int scd_diag = sensors_get_last_scd40_diag();
         if (scd_ret == ESP_OK) {
             sum_co2 += data.co2;
+            scd40_ok_count++;
+        }
+        if ((scd_ret == ESP_OK || scd_diag == SENSOR_DIAG_CO2_ZERO || scd_diag == SENSOR_DIAG_CO2_TOO_HIGH) &&
+            (data.scd_temp != 0.0f || data.scd_hum != 0.0f)) {
             sum_scd_temp += data.scd_temp;
             sum_scd_hum += data.scd_hum;
-            scd40_ok_count++;
-        } else {
+            scd40_temp_hum_count++;
+        }
+        if (scd_ret != ESP_OK && scd_diag != SENSOR_DIAG_NOT_READY) {
             scd40_error_count++;
         }
 
@@ -288,8 +303,10 @@ static void sensor_task(void *pv) {
             SensorData window_avg = {0};
 
             if (scd40_ok_count > 0) {
-                double denom = (double)scd40_ok_count;
                 window_avg.co2 = (uint16_t)(sum_co2 / scd40_ok_count);
+            }
+            if (scd40_temp_hum_count > 0) {
+                double denom = (double)scd40_temp_hum_count;
                 window_avg.scd_temp = (float)(sum_scd_temp / denom);
                 window_avg.scd_hum = (float)(sum_scd_hum / denom);
             }
@@ -323,6 +340,7 @@ static void sensor_task(void *pv) {
             sample_slot = 0;
             sum_co2 = 0;
             scd40_ok_count = 0;
+            scd40_temp_hum_count = 0;
             scd40_error_count = 0;
             sen55_ok_count = 0;
             voc_nox_ok_count = 0;
