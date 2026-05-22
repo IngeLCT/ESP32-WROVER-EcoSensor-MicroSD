@@ -127,15 +127,19 @@ static void post_temp_hum_debug_sample(const SensorData *data,
     float scd_offset_c = 0.0f;
     uint16_t scd_offset_raw = 0;
     bool scd_offset_valid = sensors_get_scd40_temperature_offset(&scd_offset_c, &scd_offset_raw);
+    float sen55_offset_c = 0.0f;
+    int16_t sen55_offset_raw = 0;
+    bool sen55_offset_valid = sensors_get_sen55_temperature_offset(&sen55_offset_c, &sen55_offset_raw);
 
-    char payload[512];
+    char payload[640];
     int len = snprintf(payload,
                        sizeof(payload),
                        "{\"device_id\":\"%s\",\"sample_slot\":%d,\"uptime_s\":%lu,"
                        "\"scd_ret\":%d,\"sen_ret\":%d,\"scd_diag\":%d,"
                        "\"co2\":%u,\"scd_temp\":%.2f,\"scd_hum\":%.2f,"
                        "\"sen_temp\":%.2f,\"sen_hum\":%.2f,\"avg_temp\":%.2f,\"avg_hum\":%.2f,"
-                       "\"scd_temp_offset_valid\":%s,\"scd_temp_offset\":%.3f,\"scd_temp_offset_raw\":%u}",
+                       "\"scd_temp_offset_valid\":%s,\"scd_temp_offset\":%.3f,\"scd_temp_offset_raw\":%u,"
+                       "\"sen55_offset_valid\":%s,\"sen55_offset\":%.3f,\"sen55_offset_raw\":%d}",
                        MDNS_HOSTNAME,
                        sample_slot + 1,
                        (unsigned long)(esp_timer_get_time() / 1000000ULL),
@@ -151,7 +155,10 @@ static void post_temp_hum_debug_sample(const SensorData *data,
                        data->avg_hum,
                        scd_offset_valid ? "true" : "false",
                        scd_offset_c,
-                       scd_offset_raw);
+                       scd_offset_raw,
+                       sen55_offset_valid ? "true" : "false",
+                       sen55_offset_c,
+                       sen55_offset_raw);
     if (len <= 0 || len >= (int)sizeof(payload)) {
         ESP_LOGW(TAG, "Debug temp/hum: payload demasiado grande");
         return;

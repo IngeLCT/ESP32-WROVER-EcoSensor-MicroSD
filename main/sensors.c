@@ -27,6 +27,13 @@
 #define SCD40_APPLY_TEMP_OFFSET_ON_BOOT  1
 #define SCD40_BOOT_TEMP_OFFSET_C         10.70f
 
+// Compensación temporal de prueba SEN55: offset simple, sin persistir.
+// Sensirion SEN5x usa escala offset_raw = offset_c * 200.
+#define SEN55_APPLY_TEMP_OFFSET_ON_BOOT  1
+#define SEN55_BOOT_TEMP_OFFSET_C         -3.02f
+#define SEN55_BOOT_TEMP_OFFSET_SLOPE     0
+#define SEN55_BOOT_TEMP_OFFSET_TAU_S     0
+
 #define SEN55_READY_POLLS       30
 #define SEN55_READY_DELAY_MS    20
 
@@ -51,6 +58,11 @@ static char s_last_scd40_error[24] = "OK";
 static bool s_scd40_temperature_offset_valid = false;
 static uint16_t s_scd40_temperature_offset_raw = 0;
 static float s_scd40_temperature_offset_c = 0.0f;
+static bool s_sen55_temperature_offset_valid = false;
+static int16_t s_sen55_temperature_offset_raw = 0;
+static float s_sen55_temperature_offset_c = 0.0f;
+static int16_t s_sen55_temperature_offset_slope = 0;
+static uint16_t s_sen55_temperature_offset_tau_s = 0;
 
 static int map_i2c_err_to_diag(esp_err_t err, bool is_rx_stage) {
     if (err == ESP_OK) return SENSOR_DIAG_OK;
@@ -117,6 +129,12 @@ bool sensors_get_scd40_temperature_offset(float *offset_c, uint16_t *raw_offset)
     if (offset_c) *offset_c = s_scd40_temperature_offset_c;
     if (raw_offset) *raw_offset = s_scd40_temperature_offset_raw;
     return s_scd40_temperature_offset_valid;
+}
+
+bool sensors_get_sen55_temperature_offset(float *offset_c, int16_t *raw_offset) {
+    if (offset_c) *offset_c = s_sen55_temperature_offset_c;
+    if (raw_offset) *raw_offset = s_sen55_temperature_offset_raw;
+    return s_sen55_temperature_offset_valid;
 }
 
 const char *sensors_get_last_scd40_raw_bytes(void) {
@@ -452,6 +470,83 @@ static esp_err_t sen5x_start_measurement(void) {
     return i2c_master_transmit(s_sen5x_dev, cmd, sizeof(cmd), pdMS_TO_TICKS(1000));
 }
 
+static esp_err_t sen5x_write_words(uint16_t cmd_value, const uint16_t *words, size_t word_count, uint32_t delay_ms) {
+    if (!words || word_count == 0 || word_count > 6) return ESP_ERR_INVALID_ARG;
+    uint8_t data[2 + 6 * 3] = {
+        (uint8_t)(cmd_value >> 8),
+        (uint8_t)(cmd_value & 0xFF),
+    };
+    for (size_t i = 0; i < word_count; i++) {
+        uint8_t *chunk = &data[2 + i * 3];
+        chunk[0] = (uint8_t)(words[i] >> 8);
+        chunk[1] = (uint8_t)(words[i] & 0xFF);
+        chunk[2] = sensirion_crc8(chunk, 2);
+    }
+    esp_err_t ret = i2c_master_transmit(s_sen5x_dev, data, 2 + word_count * 3, pdMS_TO_TICKS(1000));
+    if (delay_ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+    return ret;
+}
+
+static esp_err_t sen5x_read_words(uint16_t cmd_value, uint16_t *words, size_t word_count, uint32_t delay_ms) {
+    if (!words || word_count == 0 || word_count > 6) return ESP_ERR_INVALID_ARG;
+    uint8_t cmd[2] = {(uint8_t)(cmd_value >> 8), (uint8_t)(cmd_value & 0xFF)};
+    esp_err_t ret = i2c_master_transmit(s_sen5x_dev, cmd, sizeof(cmd), pdMS_TO_TICKS(1000));
+    if (ret != ESP_OK) return ret;
+    if (delay_ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+
+    uint8_t data[6 * 3] = {0};
+    ret = i2c_master_receive(s_sen5x_dev, data, word_count * 3, pdMS_TO_TICKS(1000));
+    if (ret != ESP_OK) return ret;
+
+    for (size_t i = 0; i < word_count; i++) {
+        const uint8_t *chunk = &data[i * 3];
+        if (sensirion_crc8(chunk, 2) != chunk[2]) {
+            return ESP_ERR_INVALID_CRC;
+        }
+        words[i] = ((uint16_t)chunk[0] << 8) | chunk[1];
+    }
+    return ESP_OK;
+}
+
+static void sen5x_store_temperature_offset(int16_t offset_raw, int16_t slope, uint16_t tau_s) {
+    s_sen55_temperature_offset_raw = offset_raw;
+    s_sen55_temperature_offset_c = ((float)offset_raw) / 200.0f;
+    s_sen55_temperature_offset_slope = slope;
+    s_sen55_temperature_offset_tau_s = tau_s;
+    s_sen55_temperature_offset_valid = true;
+}
+
+static esp_err_t sen5x_cache_temperature_offset(void) {
+    uint16_t words[3] = {0};
+    esp_err_t ret = sen5x_read_words(0x60B2, words, 3, 20);
+    if (ret != ESP_OK) {
+        s_sen55_temperature_offset_valid = false;
+        ESP_LOGW(TAG_SENS, "No se pudo leer temperature_offset SEN55: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    sen5x_store_temperature_offset((int16_t)words[0], (int16_t)words[1], words[2]);
+    ESP_LOGI(TAG_SENS, "SEN55 temperature_offset=%.3f C raw=%d slope=%d tau_s=%u",
+             s_sen55_temperature_offset_c,
+             s_sen55_temperature_offset_raw,
+             s_sen55_temperature_offset_slope,
+             s_sen55_temperature_offset_tau_s);
+    return ESP_OK;
+}
+
+static esp_err_t sen5x_set_temperature_offset(float offset_c, int16_t slope, uint16_t tau_s) {
+    int16_t offset_raw = (int16_t)((offset_c * 200.0f) + (offset_c >= 0.0f ? 0.5f : -0.5f));
+    uint16_t words[3] = {(uint16_t)offset_raw, (uint16_t)slope, tau_s};
+    esp_err_t ret = sen5x_write_words(0x60B2, words, 3, 20);
+    if (ret == ESP_OK) {
+        sen5x_store_temperature_offset(offset_raw, slope, tau_s);
+    }
+    return ret;
+}
+
 static esp_err_t sen5x_read_data_ready(uint8_t *data_ready) {
     uint8_t cmd[2] = {0x02, 0x02};
     esp_err_t ret = i2c_master_transmit(s_sen5x_dev, cmd, sizeof(cmd), pdMS_TO_TICKS(1000));
@@ -573,6 +668,19 @@ esp_err_t sensors_init_all(void) {
     vTaskDelay(pdMS_TO_TICKS(200));
     sen5x_device_reset();
     vTaskDelay(pdMS_TO_TICKS(100));
+#if SEN55_APPLY_TEMP_OFFSET_ON_BOOT
+    ret = sen5x_set_temperature_offset(SEN55_BOOT_TEMP_OFFSET_C,
+                                       SEN55_BOOT_TEMP_OFFSET_SLOPE,
+                                       SEN55_BOOT_TEMP_OFFSET_TAU_S);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG_SENS, "SEN55 temperature_offset temporal aplicado en arranque: %.2f C (no persistido)", SEN55_BOOT_TEMP_OFFSET_C);
+        sen5x_cache_temperature_offset();
+    } else {
+        ESP_LOGW(TAG_SENS, "No se pudo aplicar temperature_offset temporal SEN55 %.2f C: %s", SEN55_BOOT_TEMP_OFFSET_C, esp_err_to_name(ret));
+    }
+#else
+    sen5x_cache_temperature_offset();
+#endif
     sen5x_start_measurement();
     vTaskDelay(pdMS_TO_TICKS(50));
     if (s_scd40_lock) xSemaphoreTake(s_scd40_lock, portMAX_DELAY);
