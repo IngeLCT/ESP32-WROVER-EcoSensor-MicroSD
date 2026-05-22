@@ -3,6 +3,7 @@
 
 #include "driver/gpio.h"
 #include "esp_event.h"
+#include "esp_http_client.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
@@ -27,6 +28,12 @@ static const char *AP_PASS = "LCT3180940";
 #define SAMPLES_PER_AVG_WINDOW   60
 #define SEN51_VOC_NOX_WARMUP_MS  120000
 #define BOARD_POWERON_PIN        GPIO_NUM_12
+
+// DEBUG TEMPORAL: envio crudo de temperatura/humedad SCD40 y SEN55 por cada muestra.
+// Retirar cuando termine el diagnostico. No afecta SD ni promedios.
+#define DEBUG_TEMP_HUM_SAMPLE_POST       1
+#define DEBUG_TEMP_HUM_SAMPLE_ENDPOINT   "http://ecosensor-servidor.local:8765/api/debug/temp-hum-sample"
+#define DEBUG_TEMP_HUM_POST_TIMEOUT_MS   800
 
 static void wifi_event_handler(void *arg,
                                esp_event_base_t base,
@@ -106,6 +113,65 @@ static void publish_latest_average(const SensorData *avg) {
     }
 
     captive_manager_set_last_readings(&snapshot);
+}
+
+static void post_temp_hum_debug_sample(const SensorData *data,
+                                       int sample_slot,
+                                       esp_err_t scd_ret,
+                                       esp_err_t sen_ret) {
+#if DEBUG_TEMP_HUM_SAMPLE_POST
+    if (!data || captive_manager_get_state() != CAP_STATE_OPERATIONAL) {
+        return;
+    }
+
+    char payload[384];
+    int len = snprintf(payload,
+                       sizeof(payload),
+                       "{\"device_id\":\"%s\",\"sample_slot\":%d,\"uptime_s\":%lu,"
+                       "\"scd_ret\":%d,\"sen_ret\":%d,"
+                       "\"co2\":%u,\"scd_temp\":%.2f,\"scd_hum\":%.2f,"
+                       "\"sen_temp\":%.2f,\"sen_hum\":%.2f,\"avg_temp\":%.2f,\"avg_hum\":%.2f}",
+                       MDNS_HOSTNAME,
+                       sample_slot + 1,
+                       (unsigned long)(esp_timer_get_time() / 1000000ULL),
+                       (int)scd_ret,
+                       (int)sen_ret,
+                       data->co2,
+                       data->scd_temp,
+                       data->scd_hum,
+                       data->sen_temp,
+                       data->sen_hum,
+                       data->avg_temp,
+                       data->avg_hum);
+    if (len <= 0 || len >= (int)sizeof(payload)) {
+        ESP_LOGW(TAG, "Debug temp/hum: payload demasiado grande");
+        return;
+    }
+
+    esp_http_client_config_t config = {
+        .url = DEBUG_TEMP_HUM_SAMPLE_ENDPOINT,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = DEBUG_TEMP_HUM_POST_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGW(TAG, "Debug temp/hum: no se pudo crear cliente HTTP");
+        return;
+    }
+
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, payload, len);
+    esp_err_t err = esp_http_client_perform(client);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Debug temp/hum POST fallo: %s", esp_err_to_name(err));
+    }
+    esp_http_client_cleanup(client);
+#else
+    (void)data;
+    (void)sample_slot;
+    (void)scd_ret;
+    (void)sen_ret;
+#endif
 }
 
 static void sensor_task(void *pv) {
@@ -199,6 +265,7 @@ static void sensor_task(void *pv) {
         snprintf(debug.scd40_raw_bytes, sizeof(debug.scd40_raw_bytes), "%s", sensors_get_last_scd40_raw_bytes());
         snprintf(debug.scd40_error, sizeof(debug.scd40_error), "%s", sensors_get_last_scd40_error());
         captive_manager_update_sensor_debug(&debug);
+        post_temp_hum_debug_sample(&data, sample_slot, scd_ret, sen_ret);
 
 #if LOG_EACH_SAMPLE
         ESP_LOGI(TAG,

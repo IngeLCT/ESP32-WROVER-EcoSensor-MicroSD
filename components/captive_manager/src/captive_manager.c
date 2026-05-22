@@ -900,6 +900,10 @@ static esp_err_t lecturas_get(httpd_req_t *r) {
         cJSON_AddNumberToObject(root, "nox", g_last_readings.nox);
         cJSON_AddNumberToObject(root, "temp", g_last_readings.temp);
         cJSON_AddNumberToObject(root, "hum", g_last_readings.hum);
+        cJSON_AddNumberToObject(root, "scd_temp", g_last_readings.scd_temp);
+        cJSON_AddNumberToObject(root, "scd_hum", g_last_readings.scd_hum);
+        cJSON_AddNumberToObject(root, "sen_temp", g_last_readings.sen_temp);
+        cJSON_AddNumberToObject(root, "sen_hum", g_last_readings.sen_hum);
     }
 
     char *out = cJSON_PrintUnformatted(root);
