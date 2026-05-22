@@ -193,6 +193,22 @@ static esp_err_t scd4x_read_words(uint16_t cmd_value, uint32_t delay_ms, uint16_
     return ESP_OK;
 }
 
+static esp_err_t scd4x_write_word(uint16_t cmd_value, uint16_t word, uint32_t delay_ms) {
+    uint8_t data[5] = {
+        (uint8_t)(cmd_value >> 8),
+        (uint8_t)(cmd_value & 0xFF),
+        (uint8_t)(word >> 8),
+        (uint8_t)(word & 0xFF),
+        0,
+    };
+    data[4] = sensirion_crc8(&data[2], 2);
+    esp_err_t ret = i2c_master_transmit(s_scd4x_dev, data, sizeof(data), pdMS_TO_TICKS(1000));
+    if (delay_ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+    return ret;
+}
+
 static esp_err_t scd4x_get_data_ready_status(bool *ready, uint16_t *raw_status) {
     if (!ready) return ESP_ERR_INVALID_ARG;
     uint16_t status = 0;
@@ -203,6 +219,12 @@ static esp_err_t scd4x_get_data_ready_status(bool *ready, uint16_t *raw_status) 
     return ESP_OK;
 }
 
+static void scd4x_store_temperature_offset(uint16_t raw_offset) {
+    s_scd40_temperature_offset_raw = raw_offset;
+    s_scd40_temperature_offset_c = 175.0f * ((float)raw_offset / 65535.0f);
+    s_scd40_temperature_offset_valid = true;
+}
+
 static esp_err_t scd4x_cache_temperature_offset(void) {
     uint16_t raw_offset = 0;
     esp_err_t ret = scd4x_read_words(0x2318, 1, &raw_offset, 1);
@@ -211,11 +233,21 @@ static esp_err_t scd4x_cache_temperature_offset(void) {
         ESP_LOGW(TAG_SENS, "No se pudo leer temperature_offset SCD40: %s", esp_err_to_name(ret));
         return ret;
     }
-    s_scd40_temperature_offset_raw = raw_offset;
-    s_scd40_temperature_offset_c = 175.0f * ((float)raw_offset / 65535.0f);
-    s_scd40_temperature_offset_valid = true;
+    scd4x_store_temperature_offset(raw_offset);
     ESP_LOGI(TAG_SENS, "SCD40 temperature_offset=%.3f C raw=%u", s_scd40_temperature_offset_c, raw_offset);
     return ESP_OK;
+}
+
+static esp_err_t scd4x_set_temperature_offset(float offset_c) {
+    if (offset_c < 0.0f || offset_c > 20.0f) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint16_t raw_offset = (uint16_t)((offset_c * 65535.0f / 175.0f) + 0.5f);
+    esp_err_t ret = scd4x_write_word(0x241D, raw_offset, 1);
+    if (ret == ESP_OK) {
+        scd4x_store_temperature_offset(raw_offset);
+    }
+    return ret;
 }
 
 static const char *scd4x_variant_name(uint16_t raw) {
@@ -279,8 +311,34 @@ esp_err_t sensors_scd40_debug_action(const char *action, captive_manager_scd40_a
             snprintf(out->variant, sizeof(out->variant), "%s", scd4x_variant_name(variant));
         }
         scd40_result_finish(out, ret == ESP_OK ? start_ret : ret, ret == ESP_OK ? "variant leído" : esp_err_to_name(ret));
+    } else if (strcmp(selected, "get_offset") == 0) {
+        ret = scd4x_stop_measurement();
+        if (ret == ESP_OK) ret = scd4x_cache_temperature_offset();
+        esp_err_t start_ret = scd4x_start_measurement();
+        out->temperature_offset_valid = s_scd40_temperature_offset_valid;
+        out->temperature_offset_raw = s_scd40_temperature_offset_raw;
+        out->temperature_offset_c = s_scd40_temperature_offset_c;
+        scd40_result_finish(out, ret == ESP_OK ? start_ret : ret, ret == ESP_OK ? "temperature_offset leído" : esp_err_to_name(ret));
+    } else if (strncmp(selected, "set_offset:", 11) == 0) {
+        float offset_c = 0.0f;
+        if (sscanf(selected + 11, "%f", &offset_c) != 1) {
+            ret = ESP_ERR_INVALID_ARG;
+            scd40_result_finish(out, ret, "offset inválido; use set_offset:<0..20>");
+        } else {
+            ret = scd4x_stop_measurement();
+            if (ret == ESP_OK) ret = scd4x_set_temperature_offset(offset_c);
+            esp_err_t read_ret = ESP_OK;
+            if (ret == ESP_OK) read_ret = scd4x_cache_temperature_offset();
+            esp_err_t start_ret = scd4x_start_measurement();
+            out->temperature_offset_valid = s_scd40_temperature_offset_valid;
+            out->temperature_offset_raw = s_scd40_temperature_offset_raw;
+            out->temperature_offset_c = s_scd40_temperature_offset_c;
+            if (ret == ESP_OK && read_ret != ESP_OK) ret = read_ret;
+            if (ret == ESP_OK && start_ret != ESP_OK) ret = start_ret;
+            scd40_result_finish(out, ret, ret == ESP_OK ? "temperature_offset aplicado temporalmente; no persistido" : esp_err_to_name(ret));
+        }
     } else {
-        scd40_result_finish(out, ESP_ERR_INVALID_ARG, "acción inválida: use restart|reinit|serial|selftest|variant");
+        scd40_result_finish(out, ESP_ERR_INVALID_ARG, "acción inválida: use restart|reinit|serial|selftest|variant|get_offset|set_offset:<0..20>");
         ret = ESP_ERR_INVALID_ARG;
     }
 

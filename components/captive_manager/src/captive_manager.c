@@ -1055,6 +1055,9 @@ static void add_scd40_action_result(cJSON *root, const captive_manager_scd40_act
     cJSON_AddItemToObject(root, "serial_words", words);
     cJSON_AddNumberToObject(root, "variant_raw", result->variant_raw);
     cJSON_AddStringToObject(root, "variant", result->variant);
+    cJSON_AddBoolToObject(root, "temperature_offset_valid", result->temperature_offset_valid);
+    cJSON_AddNumberToObject(root, "temperature_offset_raw", result->temperature_offset_raw);
+    cJSON_AddNumberToObject(root, "temperature_offset_c", result->temperature_offset_c);
 }
 
 static esp_err_t scd40_debug_get(httpd_req_t *r) {
@@ -1080,10 +1083,16 @@ static esp_err_t scd40_debug_get(httpd_req_t *r) {
     cJSON_AddStringToObject(root, "raw_bytes", g_sensor_debug.scd40_raw_bytes);
     cJSON_AddNumberToObject(root, "last_sample_uptime_s", g_sensor_debug.last_sample_uptime_s);
 
-    char query[96] = {0};
-    char action[24] = "status";
+    char query[128] = {0};
+    char action[32] = "status";
     if (httpd_req_get_url_query_str(r, query, sizeof(query)) == ESP_OK) {
         (void)httpd_query_key_value(query, "action", action, sizeof(action));
+        if (strcmp(action, "set_offset") == 0) {
+            char offset_value[16] = {0};
+            if (httpd_query_key_value(query, "offset", offset_value, sizeof(offset_value)) == ESP_OK && offset_value[0]) {
+                snprintf(action, sizeof(action), "set_offset:%s", offset_value);
+            }
+        }
     }
     if (strcmp(action, "status") != 0) {
         captive_manager_scd40_action_result_t result = {0};

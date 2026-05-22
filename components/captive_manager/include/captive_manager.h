@@ -62,6 +62,9 @@ typedef struct {
     char serial_hex[17];
     uint16_t variant_raw;
     char variant[12];
+    bool temperature_offset_valid;
+    uint16_t temperature_offset_raw;
+    float temperature_offset_c;
 } captive_manager_scd40_action_result_t;
 
 typedef esp_err_t (*captive_manager_scd40_action_cb_t)(const char *action, captive_manager_scd40_action_result_t *out);
