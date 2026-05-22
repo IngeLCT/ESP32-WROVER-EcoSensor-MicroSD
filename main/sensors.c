@@ -22,6 +22,10 @@
 #define SCD40_CO2_SPEC_MIN      400
 #define SCD40_CO2_SPEC_MAX      2000
 
+// Calibración temporal de prueba: aplicar en cada arranque sin persistir EEPROM.
+#define SCD40_APPLY_TEMP_OFFSET_ON_BOOT  1
+#define SCD40_BOOT_TEMP_OFFSET_C         10.70f
+
 #define SEN55_READY_POLLS       30
 #define SEN55_READY_DELAY_MS    20
 
@@ -572,6 +576,15 @@ esp_err_t sensors_init_all(void) {
     vTaskDelay(pdMS_TO_TICKS(50));
     if (s_scd40_lock) xSemaphoreTake(s_scd40_lock, portMAX_DELAY);
     scd4x_cache_temperature_offset();
+#if SCD40_APPLY_TEMP_OFFSET_ON_BOOT
+    ret = scd4x_set_temperature_offset(SCD40_BOOT_TEMP_OFFSET_C);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG_SENS, "SCD40 temperature_offset temporal aplicado en arranque: %.2f C (no persistido)", SCD40_BOOT_TEMP_OFFSET_C);
+        scd4x_cache_temperature_offset();
+    } else {
+        ESP_LOGW(TAG_SENS, "No se pudo aplicar temperature_offset temporal %.2f C: %s", SCD40_BOOT_TEMP_OFFSET_C, esp_err_to_name(ret));
+    }
+#endif
     scd4x_start_measurement();
     if (s_scd40_lock) xSemaphoreGive(s_scd40_lock);
     vTaskDelay(pdMS_TO_TICKS(5000));
