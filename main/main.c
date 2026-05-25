@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 
 #include "driver/gpio.h"
@@ -35,11 +36,19 @@ const float ECO_SEN55_TEMP_OFFSET_C = -3.02f;
 #define SEN51_VOC_NOX_WARMUP_MS  120000
 #define BOARD_POWERON_PIN        GPIO_NUM_12
 
+#define MEASUREMENT_PUSH_ENDPOINT      "http://ecosensor-servidor.local:8765/api/measurements/push"
+#define MEASUREMENT_PUSH_TIMEOUT_MS    1200
+#define MEASUREMENT_PUSH_TASK_STACK    6144
+
 // DEBUG TEMPORAL: envio crudo de temperatura/humedad SCD40 y SEN55 por cada muestra.
 // Retirar cuando termine el diagnostico. No afecta SD ni promedios.
 #define DEBUG_TEMP_HUM_SAMPLE_POST       1
 #define DEBUG_TEMP_HUM_SAMPLE_ENDPOINT   "http://ecosensor-servidor.local:8765/api/debug/temp-hum-sample"
 #define DEBUG_TEMP_HUM_POST_TIMEOUT_MS   800
+
+typedef struct {
+    captive_manager_readings_t reading;
+} measurement_push_ctx_t;
 
 static void wifi_event_handler(void *arg,
                                esp_event_base_t base,
@@ -55,6 +64,133 @@ static void wifi_event_handler(void *arg,
 
 static TaskHandle_t s_sensor_task_handle = NULL;
 static bool s_sensors_started = false;
+
+static esp_err_t post_measurement_payload(const captive_manager_readings_t *reading) {
+    if (!reading || captive_manager_get_state() != CAP_STATE_OPERATIONAL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char payload[768];
+    int len = snprintf(payload,
+                       sizeof(payload),
+                       "{\"device_id\":\"%s\",\"measurement_id\":%lu,"
+                       "\"boot_id\":%lu,\"uptime_s\":%lu,\"time_valid\":%s,"
+                       "\"time_source\":\"%s\",\"timestamp\":\"%s\","
+                       "\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
+                       "\"voc\":%.2f,\"nox\":%.2f,\"co2\":%u,"
+                       "\"temp\":%.2f,\"hum\":%.2f,"
+                       "\"scd_temp\":%.2f,\"scd_hum\":%.2f,"
+                       "\"sen_temp\":%.2f,\"sen_hum\":%.2f,\"window_s\":%lu}",
+                       MDNS_HOSTNAME,
+                       (unsigned long)reading->measurement_id,
+                       (unsigned long)reading->boot_id,
+                       (unsigned long)reading->uptime_s,
+                       reading->time_valid ? "true" : "false",
+                       reading->time_valid ? "esp" : "device_uptime",
+                       reading->time_valid ? reading->timestamp : "",
+                       reading->pm1p0,
+                       reading->pm2p5,
+                       reading->pm4p0,
+                       reading->pm10p0,
+                       reading->voc,
+                       reading->nox,
+                       reading->co2,
+                       reading->temp,
+                       reading->hum,
+                       reading->scd_temp,
+                       reading->scd_hum,
+                       reading->sen_temp,
+                       reading->sen_hum,
+                       (unsigned long)reading->window_s);
+    if (len <= 0 || len >= (int)sizeof(payload)) {
+        ESP_LOGW(TAG, "Push medicion: payload demasiado grande");
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_http_client_config_t config = {
+        .url = MEASUREMENT_PUSH_ENDPOINT,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = MEASUREMENT_PUSH_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, payload, len);
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (status < 200 || status >= 300) {
+        ESP_LOGW(TAG, "Push medicion: HTTP status=%d", status);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static void measurement_push_task(void *pv) {
+    measurement_push_ctx_t *ctx = (measurement_push_ctx_t *)pv;
+    if (!ctx) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    const uint32_t retry_delay_ms[] = {0, 3000, 10000};
+    const size_t attempts = sizeof(retry_delay_ms) / sizeof(retry_delay_ms[0]);
+    for (size_t i = 0; i < attempts; i++) {
+        if (retry_delay_ms[i] > 0) {
+            vTaskDelay(pdMS_TO_TICKS(retry_delay_ms[i]));
+        }
+        esp_err_t err = post_measurement_payload(&ctx->reading);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Medicion enviada al servidor id=%lu", (unsigned long)ctx->reading.measurement_id);
+            free(ctx);
+            vTaskDelete(NULL);
+            return;
+        }
+        ESP_LOGW(TAG,
+                 "Push medicion intento %u/%u fallo: %s",
+                 (unsigned)(i + 1),
+                 (unsigned)attempts,
+                 esp_err_to_name(err));
+    }
+
+    ESP_LOGW(TAG,
+             "Medicion id=%lu no enviada tras %u intentos; queda recuperable por sincronizacion SD",
+             (unsigned long)ctx->reading.measurement_id,
+             (unsigned)attempts);
+    free(ctx);
+    vTaskDelete(NULL);
+}
+
+static void schedule_measurement_push(const captive_manager_readings_t *reading) {
+    if (!reading || captive_manager_get_state() != CAP_STATE_OPERATIONAL) {
+        return;
+    }
+
+    measurement_push_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        ESP_LOGW(TAG, "Push medicion: sin memoria para crear tarea");
+        return;
+    }
+    ctx->reading = *reading;
+
+    BaseType_t ok = xTaskCreate(measurement_push_task,
+                                "measurement_push",
+                                MEASUREMENT_PUSH_TASK_STACK,
+                                ctx,
+                                tskIDLE_PRIORITY + 1,
+                                NULL);
+    if (ok != pdPASS) {
+        ESP_LOGW(TAG, "Push medicion: no se pudo crear tarea");
+        free(ctx);
+    }
+}
 
 static void enable_board_peripherals_power(void) {
     gpio_config_t io_conf = {
@@ -119,6 +255,7 @@ static void publish_latest_average(const SensorData *avg) {
     }
 
     captive_manager_set_last_readings(&snapshot);
+    schedule_measurement_push(&snapshot);
 }
 
 static void post_temp_hum_debug_sample(const SensorData *data,
