@@ -24,11 +24,11 @@
 
 // Calibración temporal de prueba: aplicar en cada arranque sin persistir EEPROM.
 // ecosensor03 aplica 10.70 C al arrancar y luego lee/reporta el offset actual del SCD40.
-#define SCD40_APPLY_TEMP_OFFSET_ON_BOOT  0
+#define SCD40_APPLY_TEMP_OFFSET_ON_BOOT  1
 
 // Compensación temporal de prueba SEN55: offset simple, sin persistir.
 // Sensirion SEN5x usa escala offset_raw = offset_c * 200.
-#define SEN55_APPLY_TEMP_OFFSET_ON_BOOT  0
+#define SEN55_APPLY_TEMP_OFFSET_ON_BOOT  1
 #define SEN55_BOOT_TEMP_OFFSET_SLOPE     0
 #define SEN55_BOOT_TEMP_OFFSET_TAU_S     0
 
