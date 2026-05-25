@@ -21,9 +21,9 @@ static const char *MDNS_HOSTNAME = "ecosensor02";
 static const char *AP_SSID = "EcoSensor-02";
 static const char *AP_PASS = "LCT3180940";
 
-// Offset SCD40: EcoSensor01: 10.70 EcoSensor02: 10.70 EcoSensor03: 10.70
+// Offset SCD40: EcoSensor01: 7.70 EcoSensor02: 7.70 EcoSensor03: 10.70
 // Offset SEN55: EcoSensor01: -3.02 EcoSensor02: -3.02 EcoSensor03: -3.02
-const float ECO_SCD40_TEMP_OFFSET_C = 10.70f;
+const float ECO_SCD40_TEMP_OFFSET_C = 7.70f;
 const float ECO_SEN55_TEMP_OFFSET_C = -3.02f;
 
 #define LOG_EACH_SAMPLE          1
