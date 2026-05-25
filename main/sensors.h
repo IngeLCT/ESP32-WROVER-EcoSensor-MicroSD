@@ -63,5 +63,4 @@ bool sensors_get_scd40_temperature_offset(float *offset_c, uint16_t *raw_offset)
 bool sensors_get_sen55_temperature_offset(float *offset_c, int16_t *raw_offset);
 const char *sensors_get_last_scd40_raw_bytes(void);
 const char *sensors_get_last_scd40_error(void);
-esp_err_t sensors_scd40_debug_action(const char *action, captive_manager_scd40_action_result_t *out);
 void sensors_reset_diag(void);

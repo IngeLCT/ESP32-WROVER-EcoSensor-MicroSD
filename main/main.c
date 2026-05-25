@@ -18,14 +18,14 @@
 
 static const char *TAG = "EcoSensor";
 
-static const char *MDNS_HOSTNAME = "ecosensor02";
-static const char *AP_SSID = "EcoSensor-02";
+static const char *MDNS_HOSTNAME = "ecosensor03";
+static const char *AP_SSID = "EcoSensor-03";
 static const char *AP_PASS = "LCT3180940";
 
 // Offset EcoSensor01: SCD40 = 7.70 SEN55 = -3.02
 // Offset EcoSensor02: SCD40 = 7.70 SEN55 = -3.02
 // Offset EcoSensor03: SCD40 = 13.07 SEN55 = -3.02
-const float ECO_SCD40_TEMP_OFFSET_C = 7.70f;
+const float ECO_SCD40_TEMP_OFFSET_C = 13.07f;
 const float ECO_SEN55_TEMP_OFFSET_C = -3.02f;
 
 #define LOG_EACH_SAMPLE          1
@@ -40,11 +40,6 @@ const float ECO_SEN55_TEMP_OFFSET_C = -3.02f;
 #define MEASUREMENT_PUSH_TIMEOUT_MS    1200
 #define MEASUREMENT_PUSH_TASK_STACK    6144
 
-// DEBUG TEMPORAL: envio crudo de temperatura/humedad SCD40 y SEN55 por cada muestra.
-// Retirar cuando termine el diagnostico. No afecta SD ni promedios.
-#define DEBUG_TEMP_HUM_SAMPLE_POST       1
-#define DEBUG_TEMP_HUM_SAMPLE_ENDPOINT   "http://ecosensor-servidor.local:8765/api/debug/temp-hum-sample"
-#define DEBUG_TEMP_HUM_POST_TIMEOUT_MS   800
 
 typedef struct {
     captive_manager_readings_t reading;
@@ -243,94 +238,13 @@ static void publish_latest_average(const SensorData *avg) {
     if (sd_ret == ESP_OK) {
         snapshot.id = measurement_id;
         snapshot.measurement_id = measurement_id;
-        char detail[96];
-        snprintf(detail, sizeof(detail), "id=%lu time_valid=%s", (unsigned long)measurement_id, snapshot.time_valid ? "true" : "false");
-        captive_manager_record_debug_event("measurement_saved", detail);
         ESP_LOGI(TAG, "Medicion publicada y guardada en SD con id=%lu", (unsigned long)measurement_id);
     } else {
-        char detail[96];
-        snprintf(detail, sizeof(detail), "sd_ret=%s", esp_err_to_name(sd_ret));
-        captive_manager_record_debug_event("measurement_not_saved", detail);
         ESP_LOGW(TAG, "Medicion publicada SIN guardar en SD: %s", esp_err_to_name(sd_ret));
     }
 
     captive_manager_set_last_readings(&snapshot);
     schedule_measurement_push(&snapshot);
-}
-
-static void post_temp_hum_debug_sample(const SensorData *data,
-                                       int sample_slot,
-                                       esp_err_t scd_ret,
-                                       esp_err_t sen_ret) {
-#if DEBUG_TEMP_HUM_SAMPLE_POST
-    if (!data || captive_manager_get_state() != CAP_STATE_OPERATIONAL) {
-        return;
-    }
-
-    float scd_offset_c = 0.0f;
-    uint16_t scd_offset_raw = 0;
-    bool scd_offset_valid = sensors_get_scd40_temperature_offset(&scd_offset_c, &scd_offset_raw);
-    float sen55_offset_c = 0.0f;
-    int16_t sen55_offset_raw = 0;
-    bool sen55_offset_valid = sensors_get_sen55_temperature_offset(&sen55_offset_c, &sen55_offset_raw);
-
-    char payload[640];
-    int len = snprintf(payload,
-                       sizeof(payload),
-                       "{\"device_id\":\"%s\",\"sample_slot\":%d,\"uptime_s\":%lu,"
-                       "\"scd_ret\":%d,\"sen_ret\":%d,\"scd_diag\":%d,"
-                       "\"co2\":%u,\"scd_temp\":%.2f,\"scd_hum\":%.2f,"
-                       "\"sen_temp\":%.2f,\"sen_hum\":%.2f,\"avg_temp\":%.2f,\"avg_hum\":%.2f,"
-                       "\"scd_temp_offset_valid\":%s,\"scd_temp_offset\":%.3f,\"scd_temp_offset_raw\":%u,"
-                       "\"sen55_offset_valid\":%s,\"sen55_offset\":%.3f,\"sen55_offset_raw\":%d}",
-                       MDNS_HOSTNAME,
-                       sample_slot + 1,
-                       (unsigned long)(esp_timer_get_time() / 1000000ULL),
-                       (int)scd_ret,
-                       (int)sen_ret,
-                       sensors_get_last_scd40_diag(),
-                       data->co2,
-                       data->scd_temp,
-                       data->scd_hum,
-                       data->sen_temp,
-                       data->sen_hum,
-                       data->avg_temp,
-                       data->avg_hum,
-                       scd_offset_valid ? "true" : "false",
-                       scd_offset_c,
-                       scd_offset_raw,
-                       sen55_offset_valid ? "true" : "false",
-                       sen55_offset_c,
-                       sen55_offset_raw);
-    if (len <= 0 || len >= (int)sizeof(payload)) {
-        ESP_LOGW(TAG, "Debug temp/hum: payload demasiado grande");
-        return;
-    }
-
-    esp_http_client_config_t config = {
-        .url = DEBUG_TEMP_HUM_SAMPLE_ENDPOINT,
-        .method = HTTP_METHOD_POST,
-        .timeout_ms = DEBUG_TEMP_HUM_POST_TIMEOUT_MS,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) {
-        ESP_LOGW(TAG, "Debug temp/hum: no se pudo crear cliente HTTP");
-        return;
-    }
-
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_post_field(client, payload, len);
-    esp_err_t err = esp_http_client_perform(client);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Debug temp/hum POST fallo: %s", esp_err_to_name(err));
-    }
-    esp_http_client_cleanup(client);
-#else
-    (void)data;
-    (void)sample_slot;
-    (void)scd_ret;
-    (void)sen_ret;
-#endif
 }
 
 static void sensor_task(void *pv) {
@@ -405,32 +319,6 @@ static void sensor_task(void *pv) {
             sum_avg_hum += data.avg_hum;
             sen55_ok_count++;
         }
-
-        captive_manager_sensor_debug_t debug = {
-            .sample_slot = (uint32_t)(sample_slot + 1),
-            .samples_per_window = SAMPLES_PER_AVG_WINDOW,
-            .scd40_ok_count = (uint32_t)scd40_ok_count,
-            .scd40_error_count = (uint32_t)scd40_error_count,
-            .sen55_ok_count = (uint32_t)sen55_ok_count,
-            .voc_nox_ok_count = (uint32_t)voc_nox_ok_count,
-            .voc_nox_ready = voc_nox_ready_now,
-            .scd40_ret = (int)scd_ret,
-            .sen55_ret = (int)sen_ret,
-            .scd40_diag = scd_diag,
-            .sen55_diag = sen_diag,
-            .scd40_raw_co2 = sensors_get_last_scd40_raw_co2(),
-            .scd40_raw_temp = sensors_get_last_scd40_raw_temp(),
-            .scd40_raw_hum = sensors_get_last_scd40_raw_hum(),
-            .scd40_last_temp = sensors_get_last_scd40_temp(),
-            .scd40_last_hum = sensors_get_last_scd40_hum(),
-            .sen55_last_temp = sensors_get_last_sen55_temp(),
-            .sen55_last_hum = sensors_get_last_sen55_hum(),
-            .last_sample_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL),
-        };
-        snprintf(debug.scd40_raw_bytes, sizeof(debug.scd40_raw_bytes), "%s", sensors_get_last_scd40_raw_bytes());
-        snprintf(debug.scd40_error, sizeof(debug.scd40_error), "%s", sensors_get_last_scd40_error());
-        captive_manager_update_sensor_debug(&debug);
-        post_temp_hum_debug_sample(&data, sample_slot, scd_ret, sen_ret);
 
 #if LOG_EACH_SAMPLE
         ESP_LOGI(TAG,
@@ -522,15 +410,11 @@ static void sensor_start_task(void *pv) {
 
             esp_err_t sret = sensors_init_all();
             if (sret != ESP_OK) {
-                char detail[96];
-                snprintf(detail, sizeof(detail), "sensors_init=%s", esp_err_to_name(sret));
-                captive_manager_record_debug_event("sensors_init_failed", detail);
                 ESP_LOGE(TAG, "Fallo al inicializar sensores: %s", esp_err_to_name(sret));
                 vTaskDelay(pdMS_TO_TICKS(5000));
                 continue;
             }
 
-            captive_manager_record_debug_event("sensors_init_ok", "starting sensor_task");
             xTaskCreate(sensor_task, "sensor_task", SENSOR_TASK_STACK, NULL, 5, &s_sensor_task_handle);
             s_sensors_started = true;
             captive_manager_set_sensors_started(true);
@@ -571,17 +455,12 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &wifi_event_handler, NULL));
     captive_manager_set_sensors_started(false);
-    captive_manager_set_scd40_action_callback(sensors_scd40_debug_action);
     ESP_ERROR_CHECK(captive_manager_start());
 
     esp_err_t sd_ret = sd_store_init();
     if (sd_ret != ESP_OK) {
-        char detail[96];
-        snprintf(detail, sizeof(detail), "sd_init=%s", esp_err_to_name(sd_ret));
-        captive_manager_record_debug_event("sd_init_failed", detail);
         ESP_LOGW(TAG, "SD no disponible; lecturas solo en memoria hasta resolver SD: %s", esp_err_to_name(sd_ret));
     } else {
-        captive_manager_record_debug_event("sd_init_ok", "sd ready");
     }
 
     ESP_LOGI(TAG, "WiFi manager iniciado");

@@ -149,21 +149,6 @@ void sensors_reset_diag(void) {
     scd40_set_error("OK");
 }
 
-static void scd40_result_init(captive_manager_scd40_action_result_t *out, const char *action) {
-    if (!out) return;
-    memset(out, 0, sizeof(*out));
-    snprintf(out->action, sizeof(out->action), "%s", action ? action : "unknown");
-    snprintf(out->message, sizeof(out->message), "pending");
-    snprintf(out->variant, sizeof(out->variant), "UNKNOWN");
-}
-
-static void scd40_result_finish(captive_manager_scd40_action_result_t *out, esp_err_t ret, const char *message) {
-    if (!out) return;
-    out->ret = (int)ret;
-    out->ok = (ret == ESP_OK);
-    snprintf(out->message, sizeof(out->message), "%s", message ? message : esp_err_to_name(ret));
-}
-
 static uint8_t sensirion_crc8(const uint8_t *data, int len) {
     uint8_t crc = 0xFF;
     for (int i = 0; i < len; i++) {
@@ -268,102 +253,6 @@ static esp_err_t scd4x_set_temperature_offset(float offset_c) {
     if (ret == ESP_OK) {
         scd4x_store_temperature_offset(raw_offset);
     }
-    return ret;
-}
-
-static const char *scd4x_variant_name(uint16_t raw) {
-    switch (raw & 0xF000) {
-        case 0x0000: return "SCD40";
-        case 0x1000: return "SCD41";
-        case 0x5000: return "SCD43";
-        default: return "UNKNOWN";
-    }
-}
-
-esp_err_t sensors_scd40_debug_action(const char *action, captive_manager_scd40_action_result_t *out) {
-    const char *selected = (action && action[0]) ? action : "status";
-    scd40_result_init(out, selected);
-    if (!out) return ESP_ERR_INVALID_ARG;
-    if (!s_scd4x_dev) {
-        scd40_result_finish(out, ESP_ERR_INVALID_STATE, "SCD40 no inicializado");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    if (s_scd40_lock) xSemaphoreTake(s_scd40_lock, portMAX_DELAY);
-
-    esp_err_t ret = ESP_OK;
-    if (strcmp(selected, "restart") == 0) {
-        ret = scd4x_stop_measurement();
-        if (ret == ESP_OK) ret = scd4x_start_measurement();
-        scd40_result_finish(out, ret, ret == ESP_OK ? "periodic measurement reiniciada; esperar ~5s para nueva muestra" : esp_err_to_name(ret));
-    } else if (strcmp(selected, "reinit") == 0) {
-        ret = scd4x_stop_measurement();
-        if (ret == ESP_OK) ret = scd4x_send_cmd(0x3646, 30);
-        if (ret == ESP_OK) ret = scd4x_start_measurement();
-        scd40_result_finish(out, ret, ret == ESP_OK ? "sensor reinit ejecutado; esperar ~5s para nueva muestra" : esp_err_to_name(ret));
-    } else if (strcmp(selected, "serial") == 0) {
-        uint16_t words[3] = {0};
-        ret = scd4x_stop_measurement();
-        if (ret == ESP_OK) ret = scd4x_read_words(0x3682, 1, words, 3);
-        esp_err_t start_ret = scd4x_start_measurement();
-        if (ret == ESP_OK) {
-            out->serial_words[0] = words[0];
-            out->serial_words[1] = words[1];
-            out->serial_words[2] = words[2];
-            snprintf(out->serial_hex, sizeof(out->serial_hex), "%04X%04X%04X", words[0], words[1], words[2]);
-        }
-        scd40_result_finish(out, ret == ESP_OK ? start_ret : ret, ret == ESP_OK ? "serial leído" : esp_err_to_name(ret));
-    } else if (strcmp(selected, "selftest") == 0) {
-        uint16_t status = 0xFFFF;
-        ret = scd4x_stop_measurement();
-        if (ret == ESP_OK) ret = scd4x_read_words(0x3639, 10000, &status, 1);
-        esp_err_t start_ret = scd4x_start_measurement();
-        out->self_test_status = status;
-        if (ret == ESP_OK && start_ret != ESP_OK) ret = start_ret;
-        scd40_result_finish(out, ret, ret == ESP_OK ? (status == 0 ? "self-test OK" : "self-test reporta falla") : esp_err_to_name(ret));
-        out->ok = (ret == ESP_OK && status == 0);
-    } else if (strcmp(selected, "variant") == 0) {
-        uint16_t variant = 0;
-        ret = scd4x_stop_measurement();
-        if (ret == ESP_OK) ret = scd4x_read_words(0x202F, 1, &variant, 1);
-        esp_err_t start_ret = scd4x_start_measurement();
-        if (ret == ESP_OK) {
-            out->variant_raw = variant;
-            snprintf(out->variant, sizeof(out->variant), "%s", scd4x_variant_name(variant));
-        }
-        scd40_result_finish(out, ret == ESP_OK ? start_ret : ret, ret == ESP_OK ? "variant leído" : esp_err_to_name(ret));
-    } else if (strcmp(selected, "get_offset") == 0) {
-        ret = scd4x_stop_measurement();
-        if (ret == ESP_OK) ret = scd4x_cache_temperature_offset();
-        esp_err_t start_ret = scd4x_start_measurement();
-        out->temperature_offset_valid = s_scd40_temperature_offset_valid;
-        out->temperature_offset_raw = s_scd40_temperature_offset_raw;
-        out->temperature_offset_c = s_scd40_temperature_offset_c;
-        scd40_result_finish(out, ret == ESP_OK ? start_ret : ret, ret == ESP_OK ? "temperature_offset leído" : esp_err_to_name(ret));
-    } else if (strncmp(selected, "set_offset:", 11) == 0) {
-        float offset_c = 0.0f;
-        if (sscanf(selected + 11, "%f", &offset_c) != 1) {
-            ret = ESP_ERR_INVALID_ARG;
-            scd40_result_finish(out, ret, "offset inválido; use set_offset:<0..20>");
-        } else {
-            ret = scd4x_stop_measurement();
-            if (ret == ESP_OK) ret = scd4x_set_temperature_offset(offset_c);
-            esp_err_t read_ret = ESP_OK;
-            if (ret == ESP_OK) read_ret = scd4x_cache_temperature_offset();
-            esp_err_t start_ret = scd4x_start_measurement();
-            out->temperature_offset_valid = s_scd40_temperature_offset_valid;
-            out->temperature_offset_raw = s_scd40_temperature_offset_raw;
-            out->temperature_offset_c = s_scd40_temperature_offset_c;
-            if (ret == ESP_OK && read_ret != ESP_OK) ret = read_ret;
-            if (ret == ESP_OK && start_ret != ESP_OK) ret = start_ret;
-            scd40_result_finish(out, ret, ret == ESP_OK ? "temperature_offset aplicado temporalmente; no persistido" : esp_err_to_name(ret));
-        }
-    } else {
-        scd40_result_finish(out, ESP_ERR_INVALID_ARG, "acción inválida: use restart|reinit|serial|selftest|variant|get_offset|set_offset:<0..20>");
-        ret = ESP_ERR_INVALID_ARG;
-    }
-
-    if (s_scd40_lock) xSemaphoreGive(s_scd40_lock);
     return ret;
 }
 

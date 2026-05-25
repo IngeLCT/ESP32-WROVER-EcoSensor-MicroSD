@@ -41,22 +41,6 @@ static char g_last_sync_source[16] = "none";
 static int  g_connect_attempts = 0;
 static int64_t g_boot_time_ms = 0;
 static captive_manager_readings_t g_last_readings = {0};
-static captive_manager_sensor_debug_t g_sensor_debug = {0};
-static captive_manager_scd40_action_cb_t g_scd40_action_cb = NULL;
-
-#define DEBUG_EVENT_COUNT 24
-#define DEBUG_EVENT_NAME_LEN 32
-#define DEBUG_EVENT_DETAIL_LEN 120
-
-typedef struct {
-    uint32_t uptime_s;
-    char event[DEBUG_EVENT_NAME_LEN];
-    char detail[DEBUG_EVENT_DETAIL_LEN];
-} debug_event_t;
-
-static debug_event_t g_debug_events[DEBUG_EVENT_COUNT] = {0};
-static uint32_t g_debug_event_next = 0;
-static uint32_t g_debug_event_total = 0;
 
 static void restart_later_task(void *arg) {
     vTaskDelay(pdMS_TO_TICKS(800));
@@ -81,7 +65,6 @@ static void load_saved_device_time(void);
 static void get_active_ip_string(char *buf, size_t buf_size);
 static void get_current_datetime_string(char *buf, size_t buf_size);
 static void add_readings_to_json(cJSON *root, const captive_manager_readings_t *readings);
-static void add_diagnostics_common(cJSON *root);
 
 const char* captive_manager_state_str(captive_state_t st) {
     switch(st){
@@ -103,9 +86,6 @@ captive_state_t captive_manager_get_state(void){
 
 static void set_state(captive_state_t st) {
     if (g_state != st) {
-        char detail[96];
-        snprintf(detail, sizeof(detail), "%s->%s", captive_manager_state_str(g_state), captive_manager_state_str(st));
-        captive_manager_record_debug_event("state", detail);
         ESP_LOGI(TAG, "STATE: %s -> %s", captive_manager_state_str(g_state), captive_manager_state_str(st));
         g_state = st;
     }
@@ -127,28 +107,6 @@ void captive_manager_set_last_readings(const captive_manager_readings_t *reading
     g_last_readings = *readings;
 }
 
-void captive_manager_update_sensor_debug(const captive_manager_sensor_debug_t *debug) {
-    if (!debug) {
-        memset(&g_sensor_debug, 0, sizeof(g_sensor_debug));
-        return;
-    }
-    g_sensor_debug = *debug;
-}
-
-void captive_manager_set_scd40_action_callback(captive_manager_scd40_action_cb_t cb) {
-    g_scd40_action_cb = cb;
-}
-
-void captive_manager_record_debug_event(const char *event, const char *detail) {
-    uint32_t idx = g_debug_event_next % DEBUG_EVENT_COUNT;
-    g_debug_events[idx].uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
-    snprintf(g_debug_events[idx].event, sizeof(g_debug_events[idx].event), "%s", event ? event : "event");
-    snprintf(g_debug_events[idx].detail, sizeof(g_debug_events[idx].detail), "%s", detail ? detail : "");
-    g_debug_event_next = (g_debug_event_next + 1) % DEBUG_EVENT_COUNT;
-    if (g_debug_event_total < DEBUG_EVENT_COUNT) {
-        g_debug_event_total++;
-    }
-}
 
 bool captive_manager_time_is_valid(void) {
     return g_time_valid;
@@ -209,7 +167,6 @@ static esp_err_t apply_device_time(const char *date, const char *time_text) {
     snprintf(g_config_time, sizeof(g_config_time), "%s", time_text);
     g_time_valid = true;
     snprintf(g_last_sync_source, sizeof(g_last_sync_source), "server");
-    captive_manager_record_debug_event("time_sync", "server configured time");
 
     device_time_cfg_t cfg = {0};
     cfg.valid = true;
@@ -417,7 +374,6 @@ static void connect_sta(const char *ssid, const char *pass, bool from_saved) {
 }
 
 void captive_manager_notify_sta_got_ip(void) {
-    captive_manager_record_debug_event("wifi_got_ip", "STA connected");
     g_sta_have_ip = true;
     g_connect_attempts = 0;
     shutdown_ap_http();
@@ -430,9 +386,6 @@ void captive_manager_notify_sta_got_ip(void) {
 }
 
 void captive_manager_notify_sta_disconnected(int reason_code) {
-    char detail[96];
-    snprintf(detail, sizeof(detail), "reason=%d state=%s attempts=%d", reason_code, captive_manager_state_str(g_state), g_connect_attempts);
-    captive_manager_record_debug_event("wifi_disconnected", detail);
     ESP_LOGW(TAG, "STA disconnected (reason=%d) state=%s saved=%d attempts=%d",
              reason_code, captive_manager_state_str(g_state), g_using_saved, g_connect_attempts);
     g_sta_have_ip = false;
@@ -461,7 +414,6 @@ esp_err_t captive_manager_enter_recaptive(void) {
     g_connect_attempts = 0;
 
     if (wifi_store_has_credentials() && start_apsta_with_saved_credentials() == ESP_OK) {
-        captive_manager_record_debug_event("wifi_manager_apsta", "AP enabled; STA keeps retrying saved network");
     } else {
         g_using_saved = false;
         set_state(CAP_STATE_RECAPTIVE);
@@ -723,81 +675,6 @@ static void add_readings_to_json(cJSON *root, const captive_manager_readings_t *
     cJSON_AddNumberToObject(root, "sen_hum", readings->sen_hum);
 }
 
-static void add_diagnostics_common(cJSON *root) {
-    const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
-    char mdns_name[64];
-    char ip_buf[32];
-    snprintf(mdns_name, sizeof(mdns_name), "%s.local", device_id);
-    get_active_ip_string(ip_buf, sizeof(ip_buf));
-
-    cJSON_AddStringToObject(root, "device_id", device_id);
-    cJSON_AddStringToObject(root, "firmware", "ESP32-WROVER-EcoSensor-MicroSD");
-    cJSON_AddStringToObject(root, "firmware_version", ota_manager_current_version());
-    cJSON_AddStringToObject(root, "debug_schema", "2026-05-18");
-    cJSON_AddStringToObject(root, "ip", ip_buf);
-    cJSON_AddStringToObject(root, "mdns", mdns_name);
-    cJSON_AddStringToObject(root, "state", captive_manager_state_str(g_state));
-    cJSON_AddBoolToObject(root, "sta_have_ip", g_sta_have_ip);
-    cJSON_AddBoolToObject(root, "using_saved", g_using_saved);
-    cJSON_AddNumberToObject(root, "conn_attempts", g_connect_attempts);
-    cJSON_AddBoolToObject(root, "sd_ready", sd_store_is_ready());
-    cJSON_AddNumberToObject(root, "sd_last_id", sd_store_last_id());
-    cJSON_AddNumberToObject(root, "boot_id", g_boot_id);
-    cJSON_AddNumberToObject(root, "current_uptime_s", (double)(esp_timer_get_time() / 1000000ULL));
-    cJSON_AddBoolToObject(root, "time_valid", g_time_valid);
-    cJSON_AddBoolToObject(root, "needs_time_sync", !g_time_valid);
-    cJSON_AddStringToObject(root, "last_sync_source", g_last_sync_source);
-    if (g_time_valid) {
-        char current_datetime[32];
-        get_current_datetime_string(current_datetime, sizeof(current_datetime));
-        cJSON_AddStringToObject(root, "current_datetime", current_datetime);
-    } else {
-        cJSON_AddNullToObject(root, "current_datetime");
-    }
-
-    cJSON *sensor = cJSON_CreateObject();
-    cJSON_AddNumberToObject(sensor, "sample_slot", g_sensor_debug.sample_slot);
-    cJSON_AddNumberToObject(sensor, "samples_per_window", g_sensor_debug.samples_per_window);
-    cJSON_AddNumberToObject(sensor, "scd40_ok_count", g_sensor_debug.scd40_ok_count);
-    cJSON_AddNumberToObject(sensor, "scd40_error_count", g_sensor_debug.scd40_error_count);
-    cJSON_AddNumberToObject(sensor, "sen55_ok_count", g_sensor_debug.sen55_ok_count);
-    cJSON_AddNumberToObject(sensor, "voc_nox_ok_count", g_sensor_debug.voc_nox_ok_count);
-    cJSON_AddBoolToObject(sensor, "voc_nox_ready", g_sensor_debug.voc_nox_ready);
-    cJSON_AddNumberToObject(sensor, "scd40_ret", g_sensor_debug.scd40_ret);
-    cJSON_AddNumberToObject(sensor, "sen55_ret", g_sensor_debug.sen55_ret);
-    cJSON_AddNumberToObject(sensor, "scd40_diag", g_sensor_debug.scd40_diag);
-    cJSON_AddNumberToObject(sensor, "sen55_diag", g_sensor_debug.sen55_diag);
-    cJSON_AddNumberToObject(sensor, "scd40_raw_co2", g_sensor_debug.scd40_raw_co2);
-    cJSON_AddNumberToObject(sensor, "scd40_raw_temp", g_sensor_debug.scd40_raw_temp);
-    cJSON_AddNumberToObject(sensor, "scd40_raw_hum", g_sensor_debug.scd40_raw_hum);
-    cJSON_AddNumberToObject(sensor, "scd40_last_temp", g_sensor_debug.scd40_last_temp);
-    cJSON_AddNumberToObject(sensor, "scd40_last_hum", g_sensor_debug.scd40_last_hum);
-    cJSON_AddNumberToObject(sensor, "sen55_last_temp", g_sensor_debug.sen55_last_temp);
-    cJSON_AddNumberToObject(sensor, "sen55_last_hum", g_sensor_debug.sen55_last_hum);
-    cJSON_AddStringToObject(sensor, "scd40_raw_bytes", g_sensor_debug.scd40_raw_bytes);
-    cJSON_AddStringToObject(sensor, "scd40_error", g_sensor_debug.scd40_error);
-    cJSON_AddNumberToObject(sensor, "last_sample_uptime_s", g_sensor_debug.last_sample_uptime_s);
-    cJSON_AddStringToObject(sensor, "sensors_state", g_sensors_started ? "running" : "waiting");
-    cJSON_AddItemToObject(root, "sensor_debug", sensor);
-
-    cJSON *last = cJSON_CreateObject();
-    add_readings_to_json(last, &g_last_readings);
-    cJSON_AddItemToObject(root, "last_reading", last);
-
-    cJSON *events = cJSON_CreateArray();
-    uint32_t total = g_debug_event_total;
-    uint32_t start = (g_debug_event_next + DEBUG_EVENT_COUNT - total) % DEBUG_EVENT_COUNT;
-    for (uint32_t i = 0; i < total; i++) {
-        uint32_t idx = (start + i) % DEBUG_EVENT_COUNT;
-        cJSON *ev = cJSON_CreateObject();
-        cJSON_AddNumberToObject(ev, "uptime_s", g_debug_events[idx].uptime_s);
-        cJSON_AddStringToObject(ev, "event", g_debug_events[idx].event);
-        cJSON_AddStringToObject(ev, "detail", g_debug_events[idx].detail);
-        cJSON_AddItemToArray(events, ev);
-    }
-    cJSON_AddItemToObject(root, "events", events);
-}
-
 static esp_err_t status_get(httpd_req_t *r) {
     const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
     char mdns_name[64];
@@ -847,12 +724,6 @@ static esp_err_t status_get(httpd_req_t *r) {
         cJSON_AddNullToObject(root, "last_measurement_timestamp");
     }
     cJSON_AddBoolToObject(root, "last_measurement_time_valid", g_last_readings.time_valid);
-    cJSON_AddNumberToObject(root, "last_sample_uptime_s", g_sensor_debug.last_sample_uptime_s);
-    cJSON_AddNumberToObject(root, "scd40_diag", g_sensor_debug.scd40_diag);
-    cJSON_AddNumberToObject(root, "scd40_ok_count", g_sensor_debug.scd40_ok_count);
-    cJSON_AddNumberToObject(root, "scd40_error_count", g_sensor_debug.scd40_error_count);
-    cJSON_AddStringToObject(root, "scd40_error", g_sensor_debug.scd40_error);
-    cJSON_AddNumberToObject(root, "sen55_diag", g_sensor_debug.sen55_diag);
     cJSON_AddStringToObject(root, "state", captive_manager_state_str(g_state));
     cJSON_AddBoolToObject(root, "using_saved", g_using_saved);
     cJSON_AddNumberToObject(root, "conn_attempts", g_connect_attempts);
@@ -1018,93 +889,6 @@ static esp_err_t lecturas_recent_get(httpd_req_t *r) {
     cJSON_AddNumberToObject(root, "scanned", scanned);
     cJSON_AddNumberToObject(root, "count", added);
     cJSON_AddItemToObject(root, "rows", rows);
-
-    char *out = cJSON_PrintUnformatted(root);
-    httpd_resp_set_type(r, "application/json");
-    httpd_resp_sendstr(r, out);
-    free(out);
-    cJSON_Delete(root);
-    return ESP_OK;
-}
-
-static esp_err_t diagnostics_get(httpd_req_t *r) {
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddBoolToObject(root, "ok", true);
-    add_diagnostics_common(root);
-
-    char *out = cJSON_PrintUnformatted(root);
-    httpd_resp_set_type(r, "application/json");
-    httpd_resp_sendstr(r, out);
-    free(out);
-    cJSON_Delete(root);
-    return ESP_OK;
-}
-
-static void add_scd40_action_result(cJSON *root, const captive_manager_scd40_action_result_t *result) {
-    if (!root || !result) return;
-    cJSON_AddStringToObject(root, "action", result->action);
-    cJSON_AddBoolToObject(root, "action_ok", result->ok);
-    cJSON_AddNumberToObject(root, "action_ret", result->ret);
-    cJSON_AddStringToObject(root, "action_message", result->message);
-    cJSON_AddNumberToObject(root, "self_test_status", result->self_test_status);
-    cJSON_AddStringToObject(root, "serial_hex", result->serial_hex);
-    cJSON *words = cJSON_CreateArray();
-    for (int i = 0; i < 3; i++) {
-        cJSON_AddItemToArray(words, cJSON_CreateNumber(result->serial_words[i]));
-    }
-    cJSON_AddItemToObject(root, "serial_words", words);
-    cJSON_AddNumberToObject(root, "variant_raw", result->variant_raw);
-    cJSON_AddStringToObject(root, "variant", result->variant);
-    cJSON_AddBoolToObject(root, "temperature_offset_valid", result->temperature_offset_valid);
-    cJSON_AddNumberToObject(root, "temperature_offset_raw", result->temperature_offset_raw);
-    cJSON_AddNumberToObject(root, "temperature_offset_c", result->temperature_offset_c);
-}
-
-static esp_err_t scd40_debug_get(httpd_req_t *r) {
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddBoolToObject(root, "ok", true);
-    cJSON_AddStringToObject(root, "endpoint", "/debug/scd40");
-    cJSON_AddStringToObject(root, "device_id", (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor");
-    cJSON_AddNumberToObject(root, "boot_id", g_boot_id);
-    cJSON_AddNumberToObject(root, "current_uptime_s", (double)(esp_timer_get_time() / 1000000ULL));
-    cJSON_AddStringToObject(root, "sensors_state", g_sensors_started ? "running" : "waiting");
-    cJSON_AddNumberToObject(root, "sample_slot", g_sensor_debug.sample_slot);
-    cJSON_AddNumberToObject(root, "samples_per_window", g_sensor_debug.samples_per_window);
-    cJSON_AddNumberToObject(root, "scd40_ok_count", g_sensor_debug.scd40_ok_count);
-    cJSON_AddNumberToObject(root, "scd40_error_count", g_sensor_debug.scd40_error_count);
-    cJSON_AddNumberToObject(root, "scd40_ret", g_sensor_debug.scd40_ret);
-    cJSON_AddNumberToObject(root, "scd40_diag", g_sensor_debug.scd40_diag);
-    cJSON_AddStringToObject(root, "scd40_error", g_sensor_debug.scd40_error);
-    cJSON_AddNumberToObject(root, "raw_co2", g_sensor_debug.scd40_raw_co2);
-    cJSON_AddNumberToObject(root, "raw_temp", g_sensor_debug.scd40_raw_temp);
-    cJSON_AddNumberToObject(root, "raw_hum", g_sensor_debug.scd40_raw_hum);
-    cJSON_AddNumberToObject(root, "last_temp", g_sensor_debug.scd40_last_temp);
-    cJSON_AddNumberToObject(root, "last_hum", g_sensor_debug.scd40_last_hum);
-    cJSON_AddStringToObject(root, "raw_bytes", g_sensor_debug.scd40_raw_bytes);
-    cJSON_AddNumberToObject(root, "last_sample_uptime_s", g_sensor_debug.last_sample_uptime_s);
-
-    char query[128] = {0};
-    char action[32] = "status";
-    if (httpd_req_get_url_query_str(r, query, sizeof(query)) == ESP_OK) {
-        (void)httpd_query_key_value(query, "action", action, sizeof(action));
-        if (strcmp(action, "set_offset") == 0) {
-            char offset_value[16] = {0};
-            if (httpd_query_key_value(query, "offset", offset_value, sizeof(offset_value)) == ESP_OK && offset_value[0]) {
-                snprintf(action, sizeof(action), "set_offset:%s", offset_value);
-            }
-        }
-    }
-    if (strcmp(action, "status") != 0) {
-        captive_manager_scd40_action_result_t result = {0};
-        if (g_scd40_action_cb) {
-            esp_err_t ret = g_scd40_action_cb(action, &result);
-            (void)ret;
-            add_scd40_action_result(root, &result);
-        } else {
-            cJSON_AddBoolToObject(root, "action_ok", false);
-            cJSON_AddStringToObject(root, "action_message", "callback SCD40 no registrado");
-        }
-    }
 
     char *out = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(r, "application/json");
@@ -1284,9 +1068,6 @@ static httpd_uri_t uri_status           = { .uri="/status",      .method=HTTP_GE
 static httpd_uri_t uri_lecturas         = { .uri="/lecturas",    .method=HTTP_GET,    .handler=lecturas_get };
 static httpd_uri_t uri_lecturas_since   = { .uri="/lecturas/since", .method=HTTP_GET,  .handler=lecturas_since_get };
 static httpd_uri_t uri_lecturas_recent  = { .uri="/lecturas/recent", .method=HTTP_GET, .handler=lecturas_recent_get };
-static httpd_uri_t uri_diagnostics      = { .uri="/diagnostics", .method=HTTP_GET,    .handler=diagnostics_get };
-static httpd_uri_t uri_debug            = { .uri="/debug",       .method=HTTP_GET,    .handler=diagnostics_get };
-static httpd_uri_t uri_debug_scd40      = { .uri="/debug/scd40", .method=HTTP_GET,    .handler=scd40_debug_get };
 static httpd_uri_t uri_config           = { .uri="/config",      .method=HTTP_POST,   .handler=config_post };
 static httpd_uri_t uri_time             = { .uri="/time",        .method=HTTP_POST,   .handler=config_post };
 static httpd_uri_t uri_wifi_clr         = { .uri="/wifi/clear",  .method=HTTP_DELETE, .handler=wifi_clear_delete };
@@ -1314,9 +1095,6 @@ static esp_err_t start_http(void) {
         httpd_register_uri_handler(g_server, &uri_lecturas);
         httpd_register_uri_handler(g_server, &uri_lecturas_since);
         httpd_register_uri_handler(g_server, &uri_lecturas_recent);
-        httpd_register_uri_handler(g_server, &uri_diagnostics);
-        httpd_register_uri_handler(g_server, &uri_debug);
-        httpd_register_uri_handler(g_server, &uri_debug_scd40);
         httpd_register_uri_handler(g_server, &uri_config);
         httpd_register_uri_handler(g_server, &uri_time);
         httpd_register_uri_handler(g_server, &uri_wifi_clr);
