@@ -37,6 +37,8 @@ const float ECO_SEN55_TEMP_OFFSET_C = -3.02f;
 #define BOARD_POWERON_PIN        GPIO_NUM_12
 
 #define MEASUREMENT_PUSH_ENDPOINT      "http://ecosensor-servidor.local:8765/api/measurements/push"
+#define MEASUREMENT_PUSH_PORT          8765
+#define MEASUREMENT_PUSH_PATH          "/api/measurements/push"
 #define MEASUREMENT_PUSH_TIMEOUT_MS    1200
 #define MEASUREMENT_PUSH_TASK_STACK    6144
 
@@ -102,8 +104,21 @@ static esp_err_t post_measurement_payload(const captive_manager_readings_t *read
         return ESP_ERR_NO_MEM;
     }
 
+    char dynamic_push_url[160];
+    const char *push_host = captive_manager_push_host();
+    const char *push_url = MEASUREMENT_PUSH_ENDPOINT;
+    if (push_host && push_host[0]) {
+        snprintf(dynamic_push_url,
+                 sizeof(dynamic_push_url),
+                 "http://%s:%d%s",
+                 push_host,
+                 MEASUREMENT_PUSH_PORT,
+                 MEASUREMENT_PUSH_PATH);
+        push_url = dynamic_push_url;
+    }
+
     esp_http_client_config_t config = {
-        .url = MEASUREMENT_PUSH_ENDPOINT,
+        .url = push_url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = MEASUREMENT_PUSH_TIMEOUT_MS,
     };

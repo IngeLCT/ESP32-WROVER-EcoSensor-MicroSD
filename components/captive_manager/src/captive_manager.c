@@ -40,6 +40,7 @@ static uint32_t g_boot_id = 0;
 static char g_config_date[11] = {0};
 static char g_config_time[9] = {0};
 static char g_last_sync_source[16] = "none";
+static char g_push_host[64] = {0};
 static int  g_connect_attempts = 0;
 static int64_t g_boot_time_ms = 0;
 static captive_manager_readings_t g_last_readings = {0};
@@ -121,6 +122,10 @@ bool captive_manager_can_measure(void) {
 
 bool captive_manager_can_push_measurements(void) {
     return g_sta_have_ip && g_state == CAP_STATE_OPERATIONAL;
+}
+
+const char *captive_manager_push_host(void) {
+    return g_push_host;
 }
 
 uint32_t captive_manager_boot_id(void) {
@@ -717,6 +722,11 @@ static esp_err_t status_get(httpd_req_t *r) {
     cJSON_AddBoolToObject(root, "time_valid", g_time_valid);
     cJSON_AddBoolToObject(root, "needs_time_sync", !g_time_valid);
     cJSON_AddStringToObject(root, "last_sync_source", g_last_sync_source);
+    if (g_push_host[0]) {
+        cJSON_AddStringToObject(root, "push_host", g_push_host);
+    } else {
+        cJSON_AddNullToObject(root, "push_host");
+    }
     if (g_time_valid) {
         char current_datetime[32];
         get_current_datetime_string(current_datetime, sizeof(current_datetime));
@@ -1013,7 +1023,7 @@ static esp_err_t readings_clear_get(httpd_req_t *r) {
 }
 
 static esp_err_t config_post(httpd_req_t *r) {
-    char buf[256];
+    char buf[512];
     int len = httpd_req_recv(r, buf, sizeof(buf) - 1);
     if (len <= 0) return httpd_resp_send_err(r, 400, "empty");
     buf[len] = 0;
@@ -1039,6 +1049,16 @@ static esp_err_t config_post(httpd_req_t *r) {
     if (err != ESP_OK) {
         cJSON_Delete(root);
         return httpd_resp_send_err(r, 400, "invalid date/time");
+    }
+
+    cJSON *j_push_host = cJSON_GetObjectItem(root, "push_host");
+    if (!cJSON_IsString(j_push_host)) {
+        j_push_host = cJSON_GetObjectItem(root, "server_ip");
+    }
+    if (cJSON_IsString(j_push_host) && j_push_host->valuestring &&
+        strlen(j_push_host->valuestring) < sizeof(g_push_host)) {
+        snprintf(g_push_host, sizeof(g_push_host), "%s", j_push_host->valuestring);
+        ESP_LOGI(TAG, "Push host configurado por servidor: %s", g_push_host);
     }
 
     cJSON *out = cJSON_CreateObject();

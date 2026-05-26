@@ -70,6 +70,7 @@ void captive_manager_set_last_readings(const captive_manager_readings_t *reading
 bool captive_manager_time_is_valid(void);
 bool captive_manager_can_measure(void);
 bool captive_manager_can_push_measurements(void);
+const char *captive_manager_push_host(void);
 uint32_t captive_manager_boot_id(void);
 
 #ifdef __cplusplus
