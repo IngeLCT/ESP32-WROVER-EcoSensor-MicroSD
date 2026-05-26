@@ -174,9 +174,6 @@ static esp_err_t scd4x_start_measurement(void) {
     return scd4x_send_cmd(0x21B1, 0);
 }
 
-static esp_err_t scd4x_stop_measurement(void) {
-    return scd4x_send_cmd(0x3F86, 500);
-}
 
 static esp_err_t scd4x_read_words(uint16_t cmd_value, uint32_t delay_ms, uint16_t *words, size_t word_count) {
     if (!words || word_count == 0) return ESP_ERR_INVALID_ARG;

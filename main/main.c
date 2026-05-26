@@ -61,7 +61,7 @@ static TaskHandle_t s_sensor_task_handle = NULL;
 static bool s_sensors_started = false;
 
 static esp_err_t post_measurement_payload(const captive_manager_readings_t *reading) {
-    if (!reading || captive_manager_get_state() != CAP_STATE_OPERATIONAL) {
+    if (!reading || !captive_manager_can_push_measurements()) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -164,7 +164,7 @@ static void measurement_push_task(void *pv) {
 }
 
 static void schedule_measurement_push(const captive_manager_readings_t *reading) {
-    if (!reading || captive_manager_get_state() != CAP_STATE_OPERATIONAL) {
+    if (!reading || !captive_manager_can_push_measurements()) {
         return;
     }
 
@@ -403,10 +403,12 @@ static void sensor_task(void *pv) {
 static void sensor_start_task(void *pv) {
     while (1) {
         captive_state_t st = captive_manager_get_state();
-        if (st == CAP_STATE_OPERATIONAL) {
+        if (captive_manager_can_measure()) {
             ESP_LOGI(TAG,
-                     "WiFi operativo; iniciando sensores (time_valid=%s)",
-                     captive_manager_time_is_valid() ? "true" : "false");
+                     "%s; iniciando sensores (time_valid=%s, push=%s)",
+                     captive_manager_can_push_measurements() ? "WiFi operativo" : "Modo offline AP+STA",
+                     captive_manager_time_is_valid() ? "true" : "false",
+                     captive_manager_can_push_measurements() ? "habilitado" : "deshabilitado");
 
             esp_err_t sret = sensors_init_all();
             if (sret != ESP_OK) {

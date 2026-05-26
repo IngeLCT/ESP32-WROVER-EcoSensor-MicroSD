@@ -15,7 +15,8 @@ typedef enum {
     CAP_STATE_WAIT_LOGIN,
     CAP_STATE_VERIFY,
     CAP_STATE_OPERATIONAL,
-    CAP_STATE_RECAPTIVE
+    CAP_STATE_RECAPTIVE,
+    CAP_STATE_APSTA_OFFLINE
 } captive_state_t;
 
 typedef struct {
@@ -67,6 +68,8 @@ bool captive_manager_using_saved(void);
 void captive_manager_set_sensors_started(bool started);
 void captive_manager_set_last_readings(const captive_manager_readings_t *readings);
 bool captive_manager_time_is_valid(void);
+bool captive_manager_can_measure(void);
+bool captive_manager_can_push_measurements(void);
 uint32_t captive_manager_boot_id(void);
 
 #ifdef __cplusplus

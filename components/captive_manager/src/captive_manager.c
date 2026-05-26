@@ -32,7 +32,9 @@ static esp_netif_t *g_sta_netif = NULL;
 
 static bool g_sta_have_ip = false;
 static bool g_using_saved = false;
+static bool g_saved_apsta_mode = false;
 static bool g_sensors_started = false;
+static TaskHandle_t g_saved_reconnect_task = NULL;
 static bool g_time_valid = false;
 static uint32_t g_boot_id = 0;
 static char g_config_date[11] = {0};
@@ -57,6 +59,7 @@ static void shutdown_ap_http(void);
 static void start_mdns_service(void);
 static bool in_boot_grace_window(void);
 static void start_with_saved_or_manager(void);
+static void ensure_saved_reconnect_task(void);
 static esp_err_t parse_ipv4_or_fail(const char *text, esp_ip4_addr_t *out);
 static esp_err_t apply_saved_sta_ip_config(void);
 static bool validate_date_time(const char *date, const char *time_text);
@@ -64,7 +67,6 @@ static esp_err_t apply_device_time(const char *date, const char *time_text);
 static void load_saved_device_time(void);
 static void get_active_ip_string(char *buf, size_t buf_size);
 static void get_current_datetime_string(char *buf, size_t buf_size);
-static void add_readings_to_json(cJSON *root, const captive_manager_readings_t *readings);
 
 const char* captive_manager_state_str(captive_state_t st) {
     switch(st){
@@ -76,6 +78,7 @@ const char* captive_manager_state_str(captive_state_t st) {
         case CAP_STATE_VERIFY: return "VERIFY";
         case CAP_STATE_OPERATIONAL: return "OPERATIONAL";
         case CAP_STATE_RECAPTIVE: return "RECAPTIVE";
+        case CAP_STATE_APSTA_OFFLINE: return "APSTA_OFFLINE";
         default: return "UNKNOWN";
     }
 }
@@ -110,6 +113,14 @@ void captive_manager_set_last_readings(const captive_manager_readings_t *reading
 
 bool captive_manager_time_is_valid(void) {
     return g_time_valid;
+}
+
+bool captive_manager_can_measure(void) {
+    return g_sta_have_ip || g_saved_apsta_mode;
+}
+
+bool captive_manager_can_push_measurements(void) {
+    return g_sta_have_ip && g_state == CAP_STATE_OPERATIONAL;
 }
 
 uint32_t captive_manager_boot_id(void) {
@@ -189,7 +200,7 @@ static void load_saved_device_time(void) {
 
     g_time_valid = false;
     snprintf(g_last_sync_source, sizeof(g_last_sync_source), "none");
-    ESP_LOGI(TAG, "Fecha/hora requiere sincronizacion del servidor; sensores en espera hasta POST /time o POST /config");
+    ESP_LOGI(TAG, "Fecha/hora requiere sincronizacion del servidor; mediciones offline usaran uptime hasta sincronizar");
 }
 
 esp_err_t captive_manager_init(const captive_manager_cfg_t *cfg) {
@@ -232,6 +243,26 @@ static bool in_boot_grace_window(void) {
     if (g_cfg.boot_grace_ms <= 0) return false;
     int64_t now_ms = esp_timer_get_time() / 1000;
     return (now_ms - g_boot_time_ms) < g_cfg.boot_grace_ms;
+}
+
+static void saved_reconnect_task(void *arg) {
+    (void)arg;
+    const TickType_t interval = pdMS_TO_TICKS(15 * 60 * 1000);
+    while (1) {
+        vTaskDelay(interval);
+        if (g_saved_apsta_mode && !g_sta_have_ip && wifi_store_has_credentials()) {
+            ESP_LOGI(TAG, "AP+STA offline: reintentando red guardada (intervalo 15 min)");
+            g_connect_attempts = 0;
+            set_state(CAP_STATE_CONNECTING);
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
+        }
+    }
+}
+
+static void ensure_saved_reconnect_task(void) {
+    if (!g_saved_reconnect_task) {
+        xTaskCreate(saved_reconnect_task, "saved_reconnect", 3072, NULL, 4, &g_saved_reconnect_task);
+    }
 }
 
 static void start_with_saved_or_manager(void) {
@@ -304,6 +335,8 @@ static esp_err_t start_apsta_with_saved_credentials(void) {
 
     g_sta_have_ip = false;
     g_using_saved = true;
+    g_saved_apsta_mode = true;
+    ensure_saved_reconnect_task();
     set_state(CAP_STATE_CONNECTING);
     ESP_LOGI(TAG, "AP+STA activo: AP=%s, reintentando red guardada SSID=%s", ap_cfg.ap.ssid, sta_cfg.sta.ssid);
     ESP_ERROR_CHECK(esp_wifi_connect());
@@ -367,6 +400,7 @@ static void connect_sta(const char *ssid, const char *pass, bool from_saved) {
     set_state(CAP_STATE_CONNECTING);
     g_sta_have_ip = false;
     g_using_saved = from_saved;
+    g_saved_apsta_mode = false;
     g_connect_attempts = 0;
     ESP_LOGI(TAG, "(STA) Connecting to SSID=%s saved=%d", sta_cfg.sta.ssid, from_saved);
     ESP_ERROR_CHECK(esp_wifi_connect());
@@ -375,6 +409,7 @@ static void connect_sta(const char *ssid, const char *pass, bool from_saved) {
 
 void captive_manager_notify_sta_got_ip(void) {
     g_sta_have_ip = true;
+    g_saved_apsta_mode = false;
     g_connect_attempts = 0;
     shutdown_ap_http();
     esp_err_t http_err = start_http();
@@ -390,7 +425,7 @@ void captive_manager_notify_sta_disconnected(int reason_code) {
              reason_code, captive_manager_state_str(g_state), g_using_saved, g_connect_attempts);
     g_sta_have_ip = false;
 
-    if (g_state == CAP_STATE_CONNECTING || g_state == CAP_STATE_OPERATIONAL) {
+    if (g_state == CAP_STATE_CONNECTING || g_state == CAP_STATE_OPERATIONAL || g_state == CAP_STATE_APSTA_OFFLINE) {
         g_connect_attempts++;
         bool in_grace = in_boot_grace_window();
         bool under_limit = (g_connect_attempts < g_cfg.conn_max_attempts);
@@ -398,6 +433,12 @@ void captive_manager_notify_sta_disconnected(int reason_code) {
         if (under_limit || in_grace) {
             vTaskDelay(pdMS_TO_TICKS(g_cfg.conn_retry_delay_ms));
             esp_wifi_connect();
+            return;
+        }
+
+        if (g_saved_apsta_mode) {
+            ESP_LOGW(TAG, "Red guardada no disponible. AP+STA offline activo: midiendo en SD y reintentando cada 15 min");
+            set_state(CAP_STATE_APSTA_OFFLINE);
             return;
         }
 
@@ -416,6 +457,7 @@ esp_err_t captive_manager_enter_recaptive(void) {
     if (wifi_store_has_credentials() && start_apsta_with_saved_credentials() == ESP_OK) {
     } else {
         g_using_saved = false;
+        g_saved_apsta_mode = false;
         set_state(CAP_STATE_RECAPTIVE);
         ESP_ERROR_CHECK(start_ap());
         set_state(CAP_STATE_SCAN);
@@ -645,35 +687,6 @@ static esp_err_t scan_get(httpd_req_t *r) {
     return ESP_OK;
 }
 
-static void add_readings_to_json(cJSON *root, const captive_manager_readings_t *readings) {
-    if (!root || !readings) return;
-    cJSON_AddBoolToObject(root, "valid", readings->valid);
-    cJSON_AddNumberToObject(root, "id", readings->measurement_id);
-    cJSON_AddNumberToObject(root, "measurement_id", readings->measurement_id);
-    cJSON_AddNumberToObject(root, "boot_id", readings->boot_id);
-    cJSON_AddNumberToObject(root, "uptime_s", readings->uptime_s);
-    cJSON_AddNumberToObject(root, "window_s", readings->window_s);
-    cJSON_AddBoolToObject(root, "time_valid", readings->time_valid);
-    cJSON_AddStringToObject(root, "time_source", readings->time_valid ? "esp" : "pending_estimate");
-    if (readings->timestamp[0]) {
-        cJSON_AddStringToObject(root, "timestamp", readings->timestamp);
-    } else {
-        cJSON_AddNullToObject(root, "timestamp");
-    }
-    cJSON_AddNumberToObject(root, "co2", readings->co2);
-    cJSON_AddNumberToObject(root, "pm1p0", readings->pm1p0);
-    cJSON_AddNumberToObject(root, "pm2p5", readings->pm2p5);
-    cJSON_AddNumberToObject(root, "pm4p0", readings->pm4p0);
-    cJSON_AddNumberToObject(root, "pm10p0", readings->pm10p0);
-    cJSON_AddNumberToObject(root, "voc", readings->voc);
-    cJSON_AddNumberToObject(root, "nox", readings->nox);
-    cJSON_AddNumberToObject(root, "temp", readings->temp);
-    cJSON_AddNumberToObject(root, "hum", readings->hum);
-    cJSON_AddNumberToObject(root, "scd_temp", readings->scd_temp);
-    cJSON_AddNumberToObject(root, "scd_hum", readings->scd_hum);
-    cJSON_AddNumberToObject(root, "sen_temp", readings->sen_temp);
-    cJSON_AddNumberToObject(root, "sen_hum", readings->sen_hum);
-}
 
 static esp_err_t status_get(httpd_req_t *r) {
     const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
@@ -685,6 +698,8 @@ static esp_err_t status_get(httpd_req_t *r) {
     const char *wifi = "ap_mode";
     if (g_sta_have_ip) {
         wifi = "connected";
+    } else if (g_saved_apsta_mode || g_state == CAP_STATE_APSTA_OFFLINE) {
+        wifi = "apsta_offline";
     } else if (g_state == CAP_STATE_CONNECTING || g_state == CAP_STATE_VERIFY || g_state == CAP_STATE_WAIT_LOGIN) {
         wifi = "connecting";
     }
@@ -726,6 +741,9 @@ static esp_err_t status_get(httpd_req_t *r) {
     cJSON_AddBoolToObject(root, "last_measurement_time_valid", g_last_readings.time_valid);
     cJSON_AddStringToObject(root, "state", captive_manager_state_str(g_state));
     cJSON_AddBoolToObject(root, "using_saved", g_using_saved);
+    cJSON_AddBoolToObject(root, "saved_apsta_mode", g_saved_apsta_mode);
+    cJSON_AddBoolToObject(root, "can_measure", captive_manager_can_measure());
+    cJSON_AddBoolToObject(root, "can_push", captive_manager_can_push_measurements());
     cJSON_AddNumberToObject(root, "conn_attempts", g_connect_attempts);
     char *out = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(r, "application/json");
