@@ -839,6 +839,65 @@ static esp_err_t lecturas_since_get(httpd_req_t *r) {
     return ESP_OK;
 }
 
+static esp_err_t lecturas_range_get(httpd_req_t *r) {
+    char query[128] = {0};
+    uint32_t from_id = 0;
+    uint32_t to_id = 0;
+    uint32_t limit = 25;
+    uint32_t timeout_ms = 20000;
+
+    if (httpd_req_get_url_query_str(r, query, sizeof(query)) == ESP_OK) {
+        char value[24] = {0};
+        if (httpd_query_key_value(query, "from", value, sizeof(value)) == ESP_OK ||
+            httpd_query_key_value(query, "from_id", value, sizeof(value)) == ESP_OK) {
+            from_id = (uint32_t)strtoul(value, NULL, 10);
+        }
+        if (httpd_query_key_value(query, "to", value, sizeof(value)) == ESP_OK ||
+            httpd_query_key_value(query, "to_id", value, sizeof(value)) == ESP_OK) {
+            to_id = (uint32_t)strtoul(value, NULL, 10);
+        }
+        if (httpd_query_key_value(query, "limit", value, sizeof(value)) == ESP_OK) {
+            limit = (uint32_t)strtoul(value, NULL, 10);
+        }
+        if (httpd_query_key_value(query, "timeout_ms", value, sizeof(value)) == ESP_OK) {
+            timeout_ms = (uint32_t)strtoul(value, NULL, 10);
+        }
+    }
+
+    const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
+    cJSON *root = cJSON_CreateObject();
+    cJSON *rows = cJSON_CreateArray();
+    uint32_t added = 0;
+    uint32_t scanned = 0;
+    esp_err_t err = sd_store_add_readings_range(rows, from_id, to_id, limit, timeout_ms, &added, &scanned);
+
+    cJSON_AddBoolToObject(root, "ok", err == ESP_OK);
+    if (err == ESP_ERR_TIMEOUT) {
+        cJSON_AddStringToObject(root, "error", "sd_scan_timeout");
+    } else if (err != ESP_OK) {
+        cJSON_AddStringToObject(root, "error", esp_err_to_name(err));
+    }
+    cJSON_AddStringToObject(root, "device_id", device_id);
+    cJSON_AddBoolToObject(root, "sd_ready", sd_store_is_ready());
+    cJSON_AddNumberToObject(root, "from_id", from_id);
+    cJSON_AddNumberToObject(root, "to_id", to_id);
+    cJSON_AddNumberToObject(root, "last_id", sd_store_last_id());
+    cJSON_AddNumberToObject(root, "boot_id", g_boot_id);
+    cJSON_AddNumberToObject(root, "current_uptime_s", (double)(esp_timer_get_time() / 1000000ULL));
+    cJSON_AddNumberToObject(root, "requested_limit", limit);
+    cJSON_AddNumberToObject(root, "timeout_ms", timeout_ms);
+    cJSON_AddNumberToObject(root, "scanned", scanned);
+    cJSON_AddNumberToObject(root, "count", added);
+    cJSON_AddItemToObject(root, "rows", rows);
+
+    char *out = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_sendstr(r, out);
+    free(out);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
 static esp_err_t lecturas_recent_get(httpd_req_t *r) {
     char query[128] = {0};
     uint32_t after_id = 0;
@@ -1067,6 +1126,7 @@ static httpd_uri_t uri_save             = { .uri="/save",        .method=HTTP_PO
 static httpd_uri_t uri_status           = { .uri="/status",      .method=HTTP_GET,    .handler=status_get };
 static httpd_uri_t uri_lecturas         = { .uri="/lecturas",    .method=HTTP_GET,    .handler=lecturas_get };
 static httpd_uri_t uri_lecturas_since   = { .uri="/lecturas/since", .method=HTTP_GET,  .handler=lecturas_since_get };
+static httpd_uri_t uri_lecturas_range   = { .uri="/lecturas/range", .method=HTTP_GET, .handler=lecturas_range_get };
 static httpd_uri_t uri_lecturas_recent  = { .uri="/lecturas/recent", .method=HTTP_GET, .handler=lecturas_recent_get };
 static httpd_uri_t uri_config           = { .uri="/config",      .method=HTTP_POST,   .handler=config_post };
 static httpd_uri_t uri_time             = { .uri="/time",        .method=HTTP_POST,   .handler=config_post };
@@ -1094,6 +1154,7 @@ static esp_err_t start_http(void) {
         httpd_register_uri_handler(g_server, &uri_status);
         httpd_register_uri_handler(g_server, &uri_lecturas);
         httpd_register_uri_handler(g_server, &uri_lecturas_since);
+        httpd_register_uri_handler(g_server, &uri_lecturas_range);
         httpd_register_uri_handler(g_server, &uri_lecturas_recent);
         httpd_register_uri_handler(g_server, &uri_config);
         httpd_register_uri_handler(g_server, &uri_time);

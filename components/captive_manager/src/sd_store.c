@@ -473,8 +473,8 @@ static uint32_t normalize_timeout_ms(uint32_t timeout_ms) {
     if (timeout_ms == 0) {
         return 1200;
     }
-    if (timeout_ms > 3000) {
-        return 3000;
+    if (timeout_ms > 30000) {
+        return 30000;
     }
     return timeout_ms;
 }
@@ -516,6 +516,64 @@ esp_err_t sd_store_add_readings_since(cJSON *array, uint32_t after_id, uint32_t 
         scanned_rows++;
         if (parsed.id <= after_id) {
             continue;
+        }
+
+        add_row_json(array, &parsed);
+        count++;
+    }
+    fclose(f);
+    if (g_lock) xSemaphoreGive(g_lock);
+
+    if (added) {
+        *added = count;
+    }
+    if (scanned) {
+        *scanned = scanned_rows;
+    }
+    return result;
+}
+
+esp_err_t sd_store_add_readings_range(cJSON *array, uint32_t from_id, uint32_t to_id, uint32_t limit, uint32_t timeout_ms, uint32_t *added, uint32_t *scanned) {
+    if (!g_ready || !array) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (from_id == 0 || to_id == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint32_t start_id = from_id < to_id ? from_id : to_id;
+    uint32_t end_id = from_id > to_id ? from_id : to_id;
+    limit = normalize_limit(limit);
+    timeout_ms = normalize_timeout_ms(timeout_ms);
+
+    if (g_lock && xSemaphoreTake(g_lock, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    FILE *f = fopen(CSV_PATH, "r");
+    if (!f) {
+        if (g_lock) xSemaphoreGive(g_lock);
+        return ESP_FAIL;
+    }
+
+    char line[320];
+    uint32_t count = 0;
+    uint32_t scanned_rows = 0;
+    esp_err_t result = ESP_OK;
+    int64_t started_us = esp_timer_get_time();
+    while (fgets(line, sizeof(line), f) && count < limit) {
+        if ((scanned_rows & 0x0F) == 0 && scan_timed_out(started_us, timeout_ms)) {
+            result = ESP_ERR_TIMEOUT;
+            break;
+        }
+        sd_store_row_t parsed = {0};
+        if (!parse_csv_line(line, &parsed)) {
+            continue;
+        }
+        scanned_rows++;
+        if (parsed.id < start_id) {
+            continue;
+        }
+        if (parsed.id > end_id) {
+            break;
         }
 
         add_row_json(array, &parsed);
