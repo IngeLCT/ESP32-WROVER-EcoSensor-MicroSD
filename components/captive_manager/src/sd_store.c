@@ -23,6 +23,45 @@ static const char *CSV_HEADER = "id,boot_id,uptime_s,time_valid,timestamp,co2,pm
 static bool g_ready = false;
 static uint32_t g_last_id = 0;
 static SemaphoreHandle_t g_lock = NULL;
+static long *g_id_offsets = NULL;
+static uint32_t g_id_offsets_capacity = 0;
+
+static bool ensure_offset_capacity(uint32_t id) {
+    if (id < g_id_offsets_capacity) {
+        return true;
+    }
+    uint32_t new_capacity = g_id_offsets_capacity ? g_id_offsets_capacity : 256;
+    while (id >= new_capacity) {
+        new_capacity *= 2;
+    }
+    long *new_offsets = realloc(g_id_offsets, sizeof(long) * new_capacity);
+    if (!new_offsets) {
+        ESP_LOGW(TAG, "No hay memoria para indice SD id=%lu", (unsigned long)id);
+        return false;
+    }
+    for (uint32_t i = g_id_offsets_capacity; i < new_capacity; ++i) {
+        new_offsets[i] = -1;
+    }
+    g_id_offsets = new_offsets;
+    g_id_offsets_capacity = new_capacity;
+    return true;
+}
+
+static void set_id_offset(uint32_t id, long offset) {
+    if (id == 0 || offset < 0) {
+        return;
+    }
+    if (ensure_offset_capacity(id)) {
+        g_id_offsets[id] = offset;
+    }
+}
+
+static long get_id_offset(uint32_t id) {
+    if (id == 0 || id >= g_id_offsets_capacity || !g_id_offsets) {
+        return -1;
+    }
+    return g_id_offsets[id];
+}
 
 static bool file_exists(const char *path) {
     struct stat st = {0};
@@ -58,19 +97,27 @@ static uint32_t scan_last_id(void) {
         return 0;
     }
 
-    char line[256];
+    char line[320];
     uint32_t last = 0;
     uint32_t rows = 0;
-    while (fgets(line, sizeof(line), f)) {
+    while (1) {
+        long offset = ftell(f);
+        if (!fgets(line, sizeof(line), f)) {
+            break;
+        }
         char *end = NULL;
         unsigned long id = strtoul(line, &end, 10);
-        if (end && *end == ',' && id > last) {
-            last = (uint32_t)id;
+        if (end && *end == ',' && id > 0) {
+            set_id_offset((uint32_t)id, offset);
+            if (id > last) {
+                last = (uint32_t)id;
+            }
             rows++;
         }
     }
     fclose(f);
-    ESP_LOGI(TAG, "CSV escaneado: filas=%lu ultimo_id=%lu", (unsigned long)rows, (unsigned long)last);
+    ESP_LOGI(TAG, "CSV escaneado/indexado: filas=%lu ultimo_id=%lu indice_cap=%lu",
+             (unsigned long)rows, (unsigned long)last, (unsigned long)g_id_offsets_capacity);
     return last;
 }
 
@@ -170,6 +217,11 @@ esp_err_t sd_store_clear(void) {
         return ESP_FAIL;
     }
     g_last_id = 0;
+    if (g_id_offsets) {
+        for (uint32_t i = 0; i < g_id_offsets_capacity; ++i) {
+            g_id_offsets[i] = -1;
+        }
+    }
     if (g_lock) xSemaphoreGive(g_lock);
     ESP_LOGI(TAG, "Historial SD borrado correctamente; ultimo_id=0");
     return ESP_OK;
@@ -218,6 +270,7 @@ esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uin
         return ESP_FAIL;
     }
 
+    long row_offset = ftell(f);
     int written = fprintf(f,
                           "%lu,%lu,%lu,%u,%s,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%lu\n",
                           (unsigned long)id,
@@ -261,6 +314,8 @@ esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uin
         if (g_lock) xSemaphoreGive(g_lock);
         return ESP_FAIL;
     }
+
+    set_id_offset(id, row_offset);
 
     if (g_lock) xSemaphoreGive(g_lock);
 
@@ -552,6 +607,12 @@ esp_err_t sd_store_add_readings_range(cJSON *array, uint32_t from_id, uint32_t t
     if (!f) {
         if (g_lock) xSemaphoreGive(g_lock);
         return ESP_FAIL;
+    }
+
+    long start_offset = get_id_offset(start_id);
+    if (start_offset >= 0 && fseek(f, start_offset, SEEK_SET) != 0) {
+        ESP_LOGW(TAG, "No se pudo posicionar CSV en id=%lu offset=%ld", (unsigned long)start_id, start_offset);
+        rewind(f);
     }
 
     char line[320];
