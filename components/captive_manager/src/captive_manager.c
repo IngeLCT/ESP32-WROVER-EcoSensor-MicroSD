@@ -24,6 +24,7 @@
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <dirent.h>
 
 static const char *TAG = "wifi_manager";
 
@@ -865,9 +866,34 @@ static esp_err_t sd_web_asset_get(httpd_req_t *r, const char *name) {
     return httpd_resp_send_err(r, 404, "web asset not found");
 }
 
-static esp_err_t sd_style_get(httpd_req_t *r) { return sd_web_asset_get(r, "style.css"); }
-static esp_err_t sd_script_get(httpd_req_t *r) { return sd_web_asset_get(r, "script.js"); }
-static esp_err_t sd_logo_get(httpd_req_t *r) { return sd_web_asset_get(r, "Recurso2.png"); }
+static esp_err_t sd_style_get(httpd_req_t *r) { return sd_web_asset_get(r, "st.css"); }
+static esp_err_t sd_script_get(httpd_req_t *r) { return sd_web_asset_get(r, "sc.js"); }
+static esp_err_t sd_logo_get(httpd_req_t *r) { return sd_web_asset_get(r, "lct.png"); }
+
+static void clear_sd_web_dir(void) {
+    if (!sd_store_is_ready()) return;
+
+    DIR *dir = opendir("/sdcard/web");
+    if (!dir) {
+        return;
+    }
+
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        char path[320];
+        snprintf(path, sizeof(path), "/sdcard/web/%s", entry->d_name);
+        if (remove(path) != 0) {
+            ESP_LOGW(TAG, "No se pudo borrar asset residual %s errno=%d (%s)", path, errno, strerror(errno));
+        }
+    }
+    closedir(dir);
+    if (rmdir("/sdcard/web") != 0 && errno != ENOENT) {
+        ESP_LOGW(TAG, "No se pudo borrar directorio /sdcard/web errno=%d (%s)", errno, strerror(errno));
+    }
+}
 
 static esp_err_t ensure_sd_web_dir(void) {
     if (!sd_store_is_ready()) return ESP_ERR_INVALID_STATE;
@@ -878,14 +904,19 @@ static esp_err_t ensure_sd_web_dir(void) {
     return ESP_OK;
 }
 
-static esp_err_t download_web_asset_to_sd(const char *url, const char *name, size_t *out_bytes) {
-    if (!url || !url[0] || !safe_web_asset_name(name)) return ESP_ERR_INVALID_ARG;
-    if (ensure_sd_web_dir() != ESP_OK) return ESP_ERR_INVALID_STATE;
+static esp_err_t download_web_asset_to_sd(const char *url, const char *name, size_t *out_bytes, char *err_buf, size_t err_buf_size) {
+    if (err_buf && err_buf_size) err_buf[0] = '\0';
+    if (!url || !url[0] || !safe_web_asset_name(name)) {
+        if (err_buf && err_buf_size) snprintf(err_buf, err_buf_size, "invalid_arg");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (ensure_sd_web_dir() != ESP_OK) {
+        if (err_buf && err_buf_size) snprintf(err_buf, err_buf_size, "sd_web_dir_failed");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     char final_path[96];
-    const char *temp_path = "/sdcard/web/asset.tmp";
     snprintf(final_path, sizeof(final_path), "/sdcard/web/%s", name);
-    remove(temp_path);
 
     esp_http_client_config_t cfg = {
         .url = url,
@@ -893,10 +924,14 @@ static esp_err_t download_web_asset_to_sd(const char *url, const char *name, siz
         .buffer_size = 1024,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) return ESP_ERR_NO_MEM;
+    if (!client) {
+        if (err_buf && err_buf_size) snprintf(err_buf, err_buf_size, "http_client_init_failed");
+        return ESP_ERR_NO_MEM;
+    }
 
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
+        if (err_buf && err_buf_size) snprintf(err_buf, err_buf_size, "http_open:%s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
         return err;
     }
@@ -906,15 +941,18 @@ static esp_err_t download_web_asset_to_sd(const char *url, const char *name, siz
     if (status && (status < 200 || status >= 300)) {
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
-        ESP_LOGW(TAG, "HTTP asset %s status=%d", name, status);
+        ESP_LOGW(TAG, "HTTP asset %s status=%d url=%s", name, status, url);
+        if (err_buf && err_buf_size) snprintf(err_buf, err_buf_size, "http_status:%d", status);
         return ESP_FAIL;
     }
 
-    FILE *f = fopen(temp_path, "wb");
+    remove(final_path);
+    FILE *f = fopen(final_path, "wb");
     if (!f) {
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
-        ESP_LOGE(TAG, "No se pudo abrir %s errno=%d (%s)", temp_path, errno, strerror(errno));
+        ESP_LOGE(TAG, "No se pudo abrir %s errno=%d (%s)", final_path, errno, strerror(errno));
+        if (err_buf && err_buf_size) snprintf(err_buf, err_buf_size, "fopen:%d:%s", errno, strerror(errno));
         return ESP_FAIL;
     }
 
@@ -924,6 +962,7 @@ static esp_err_t download_web_asset_to_sd(const char *url, const char *name, siz
         int read_len = esp_http_client_read(client, buffer, sizeof(buffer));
         if (read_len < 0) {
             err = ESP_FAIL;
+            if (err_buf && err_buf_size) snprintf(err_buf, err_buf_size, "http_read_failed");
             break;
         }
         if (read_len == 0) {
@@ -931,32 +970,33 @@ static esp_err_t download_web_asset_to_sd(const char *url, const char *name, siz
         }
         if (fwrite(buffer, 1, read_len, f) != (size_t)read_len) {
             err = ESP_FAIL;
+            if (err_buf && err_buf_size) snprintf(err_buf, err_buf_size, "fwrite:%d:%s", errno, strerror(errno));
             break;
         }
         total += (size_t)read_len;
     }
 
+    if (fflush(f) != 0) {
+        err = ESP_FAIL;
+        if (err_buf && err_buf_size) snprintf(err_buf, err_buf_size, "fflush:%d:%s", errno, strerror(errno));
+    }
     fclose(f);
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
     if (err != ESP_OK) {
-        remove(temp_path);
+        remove(final_path);
+        if (out_bytes) *out_bytes = total;
         return err;
-    }
-    remove(final_path);
-    if (rename(temp_path, final_path) != 0) {
-        ESP_LOGE(TAG, "No se pudo renombrar %s -> %s errno=%d (%s)", temp_path, final_path, errno, strerror(errno));
-        remove(temp_path);
-        return ESP_FAIL;
     }
     if (out_bytes) *out_bytes = total;
     ESP_LOGI(TAG, "Asset web guardado en SD: %s (%u bytes)", final_path, (unsigned)total);
     return ESP_OK;
 }
 
+
 static esp_err_t tabla_get(httpd_req_t *r) {
-    if (serve_sd_web_file(r, "index.html")) return ESP_OK;
+    if (serve_sd_web_file(r, "in.html")) return ESP_OK;
 
     const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
 
@@ -1329,6 +1369,13 @@ static esp_err_t web_update_post(httpd_req_t *r) {
         return httpd_resp_send_err(r, 400, "files array required");
     }
 
+    clear_sd_web_dir();
+    esp_err_t dir_err = ensure_sd_web_dir();
+    if (dir_err != ESP_OK) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(r, 500, "sd web dir failed");
+    }
+
     int saved = 0;
     int failed = 0;
     cJSON *details = cJSON_CreateArray();
@@ -1341,12 +1388,16 @@ static esp_err_t web_update_post(httpd_req_t *r) {
             continue;
         }
         size_t bytes = 0;
-        esp_err_t err = download_web_asset_to_sd(j_url->valuestring, j_name->valuestring, &bytes);
+        char err_detail[96] = {0};
+        esp_err_t err = download_web_asset_to_sd(j_url->valuestring, j_name->valuestring, &bytes, err_detail, sizeof(err_detail));
         cJSON *row = cJSON_CreateObject();
         cJSON_AddStringToObject(row, "name", j_name->valuestring);
         cJSON_AddBoolToObject(row, "ok", err == ESP_OK);
         cJSON_AddNumberToObject(row, "bytes", (double)bytes);
-        if (err != ESP_OK) cJSON_AddStringToObject(row, "error", esp_err_to_name(err));
+        if (err != ESP_OK) {
+            cJSON_AddStringToObject(row, "error", esp_err_to_name(err));
+            if (err_detail[0]) cJSON_AddStringToObject(row, "detail", err_detail);
+        }
         cJSON_AddItemToArray(details, row);
         if (err == ESP_OK) saved++; else failed++;
     }
@@ -1456,9 +1507,9 @@ static httpd_uri_t uri_status           = { .uri="/status",      .method=HTTP_GE
 static httpd_uri_t uri_lecturas         = { .uri="/lecturas",    .method=HTTP_GET,    .handler=lecturas_get };
 static httpd_uri_t uri_tabla            = { .uri="/tabla",       .method=HTTP_GET,    .handler=tabla_get };
 static httpd_uri_t uri_api_latest       = { .uri="/api/latest",  .method=HTTP_GET,    .handler=lecturas_get };
-static httpd_uri_t uri_web_style        = { .uri="/style.css",    .method=HTTP_GET,    .handler=sd_style_get };
-static httpd_uri_t uri_web_script       = { .uri="/script.js",    .method=HTTP_GET,    .handler=sd_script_get };
-static httpd_uri_t uri_web_logo         = { .uri="/Recurso2.png", .method=HTTP_GET,    .handler=sd_logo_get };
+static httpd_uri_t uri_web_style        = { .uri="/st.css",       .method=HTTP_GET,    .handler=sd_style_get };
+static httpd_uri_t uri_web_script       = { .uri="/sc.js",       .method=HTTP_GET,    .handler=sd_script_get };
+static httpd_uri_t uri_web_logo         = { .uri="/lct.png",     .method=HTTP_GET,    .handler=sd_logo_get };
 static httpd_uri_t uri_lecturas_since   = { .uri="/lecturas/since", .method=HTTP_GET,  .handler=lecturas_since_get };
 static httpd_uri_t uri_lecturas_range   = { .uri="/lecturas/range", .method=HTTP_GET, .handler=lecturas_range_get };
 static httpd_uri_t uri_lecturas_recent  = { .uri="/lecturas/recent", .method=HTTP_GET, .handler=lecturas_recent_get };
