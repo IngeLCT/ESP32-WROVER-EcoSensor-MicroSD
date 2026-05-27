@@ -135,7 +135,7 @@ esp_err_t sd_store_init(void) {
 
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
-        .max_files = 4,
+        .max_files = 8,
         .allocation_unit_size = 16 * 1024,
     };
 
