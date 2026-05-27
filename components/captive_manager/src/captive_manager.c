@@ -883,9 +883,9 @@ static esp_err_t download_web_asset_to_sd(const char *url, const char *name, siz
     if (ensure_sd_web_dir() != ESP_OK) return ESP_ERR_INVALID_STATE;
 
     char final_path[96];
-    char temp_path[112];
+    const char *temp_path = "/sdcard/web/asset.tmp";
     snprintf(final_path, sizeof(final_path), "/sdcard/web/%s", name);
-    snprintf(temp_path, sizeof(temp_path), "/sdcard/web/%s.tmp", name);
+    remove(temp_path);
 
     esp_http_client_config_t cfg = {
         .url = url,
@@ -944,7 +944,9 @@ static esp_err_t download_web_asset_to_sd(const char *url, const char *name, siz
         remove(temp_path);
         return err;
     }
+    remove(final_path);
     if (rename(temp_path, final_path) != 0) {
+        ESP_LOGE(TAG, "No se pudo renombrar %s -> %s errno=%d (%s)", temp_path, final_path, errno, strerror(errno));
         remove(temp_path);
         return ESP_FAIL;
     }
