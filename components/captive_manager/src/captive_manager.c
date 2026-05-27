@@ -996,7 +996,7 @@ static esp_err_t download_web_asset_to_sd(const char *url, const char *name, siz
 
 
 static esp_err_t tabla_get(httpd_req_t *r) {
-    if (serve_sd_web_file(r, "in.html")) return ESP_OK;
+    if (serve_sd_web_file(r, "in.htm")) return ESP_OK;
 
     const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
 
