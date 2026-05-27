@@ -816,19 +816,6 @@ static esp_err_t lecturas_get(httpd_req_t *r) {
 
 static esp_err_t tabla_get(httpd_req_t *r) {
     const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
-    char mdns_name[64];
-    char ip_buf[32];
-    snprintf(mdns_name, sizeof(mdns_name), "%s.local", device_id);
-    get_active_ip_string(ip_buf, sizeof(ip_buf));
-
-    const char *wifi = "AP/configuracion";
-    if (g_sta_have_ip) {
-        wifi = "Conectado";
-    } else if (g_saved_apsta_mode || g_state == CAP_STATE_APSTA_OFFLINE) {
-        wifi = "AP+STA offline";
-    } else if (g_state == CAP_STATE_CONNECTING || g_state == CAP_STATE_VERIFY || g_state == CAP_STATE_WAIT_LOGIN) {
-        wifi = "Conectando";
-    }
 
     httpd_resp_set_type(r, "text/html; charset=utf-8");
     httpd_resp_send_chunk(r,
@@ -846,16 +833,14 @@ static esp_err_t tabla_get(httpd_req_t *r) {
         "table{width:100%;border-spacing:0;border-collapse:separate;margin-top:20px}"
         "th,td{font-size:25px;text-align:center;border:1px solid black;border-radius:10px;padding:8px;background:#ffffff66}"
         "th{background-color:#80ffd4}"
-        ".estado{font-size:16px;margin-top:18px}.aviso{font-size:22px;background:#fff3b0;border:1px solid #000;border-radius:10px;padding:12px}"
+        ".estado{font-size:18px;margin-top:18px}.aviso{font-size:22px;background:#fff3b0;border:1px solid #000;border-radius:10px;padding:12px}"
         "@media(max-width:640px){body{padding:6%}th,td{font-size:18px;padding:7px}h1{font-size:23px}h2{font-size:20px}p{font-size:16px}}"
         "</style></head><body>", -1);
 
     httpd_resp_send_chunk(r, "<h1>LCT Didacticos</h1>", -1);
-    httpd_resp_send_chunk(r, "<h2>EcoSensor: Calidad de Aire</h2>", -1);
     char buf[256];
     snprintf(buf, sizeof(buf), "<h2>ID: %s</h2>", device_id);
     httpd_resp_send_chunk(r, buf, -1);
-    httpd_resp_send_chunk(r, "<h2>Ultima medicion</h2>", -1);
 
     if (!g_last_readings.valid) {
         httpd_resp_send_chunk(r,
@@ -873,24 +858,23 @@ static esp_err_t tabla_get(httpd_req_t *r) {
         snprintf(buf, sizeof(buf), "<tr><td>NOx</td><td>%.2f</td><td>indice</td></tr>", g_last_readings.nox); httpd_resp_send_chunk(r, buf, -1);
         snprintf(buf, sizeof(buf), "<tr><td>Temperatura</td><td>%.2f</td><td>&deg;C</td></tr>", g_last_readings.temp); httpd_resp_send_chunk(r, buf, -1);
         snprintf(buf, sizeof(buf), "<tr><td>Humedad</td><td>%.2f</td><td>%%</td></tr>", g_last_readings.hum); httpd_resp_send_chunk(r, buf, -1);
-        snprintf(buf, sizeof(buf), "<tr><td>SCD40 Temp</td><td>%.2f</td><td>&deg;C</td></tr>", g_last_readings.scd_temp); httpd_resp_send_chunk(r, buf, -1);
-        snprintf(buf, sizeof(buf), "<tr><td>SCD40 Hum</td><td>%.2f</td><td>%%</td></tr>", g_last_readings.scd_hum); httpd_resp_send_chunk(r, buf, -1);
-        snprintf(buf, sizeof(buf), "<tr><td>SEN55 Temp</td><td>%.2f</td><td>&deg;C</td></tr>", g_last_readings.sen_temp); httpd_resp_send_chunk(r, buf, -1);
-        snprintf(buf, sizeof(buf), "<tr><td>SEN55 Hum</td><td>%.2f</td><td>%%</td></tr>", g_last_readings.sen_hum); httpd_resp_send_chunk(r, buf, -1);
         httpd_resp_send_chunk(r, "</table>", -1);
 
-        const char *time_text = g_last_readings.timestamp[0] ? g_last_readings.timestamp : "Pendiente de sincronizar";
-        snprintf(buf, sizeof(buf), "<p class=\"estado\">Fecha/Hora: <span>%s</span></p>", time_text);
-        httpd_resp_send_chunk(r, buf, -1);
-        snprintf(buf, sizeof(buf), "<p class=\"estado\">Ventana: <span>%lu s</span> &nbsp; Medicion: <span>%lu</span></p>",
-                 (unsigned long)g_last_readings.window_s,
-                 (unsigned long)g_last_readings.measurement_id);
-        httpd_resp_send_chunk(r, buf, -1);
+        if (g_last_readings.timestamp[0] && strlen(g_last_readings.timestamp) >= 19) {
+            char date_text[11];
+            char time_text[9];
+            snprintf(date_text, sizeof(date_text), "%.2s-%.2s-%.4s", g_last_readings.timestamp + 8, g_last_readings.timestamp + 5, g_last_readings.timestamp);
+            snprintf(time_text, sizeof(time_text), "%.8s", g_last_readings.timestamp + 11);
+            snprintf(buf, sizeof(buf), "<p class=\"estado\">Fecha de última medición: <span>%s</span></p>", date_text);
+            httpd_resp_send_chunk(r, buf, -1);
+            snprintf(buf, sizeof(buf), "<p class=\"estado\">Hora última medición: <span>%s</span></p>", time_text);
+            httpd_resp_send_chunk(r, buf, -1);
+        } else {
+            httpd_resp_send_chunk(r, "<p class=\"estado\">Fecha de última medición: Pendiente</p>", -1);
+            httpd_resp_send_chunk(r, "<p class=\"estado\">Hora última medición: Pendiente</p>", -1);
+        }
     }
 
-    snprintf(buf, sizeof(buf), "<p class=\"estado\">WiFi: %s &nbsp; IP: %s &nbsp; mDNS: %s</p>", wifi, ip_buf, mdns_name);
-    httpd_resp_send_chunk(r, buf, -1);
-    httpd_resp_send_chunk(r, "<p class=\"estado\">Actualizacion automatica cada 20 segundos</p>", -1);
     httpd_resp_send_chunk(r, "</body></html>", -1);
     httpd_resp_send_chunk(r, NULL, 0);
     return ESP_OK;
