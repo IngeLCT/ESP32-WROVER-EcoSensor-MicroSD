@@ -831,7 +831,7 @@ static bool safe_web_asset_name(const char *name) {
 static const char *web_asset_content_type(const char *name) {
     const char *ext = strrchr(name ? name : "", '.');
     if (!ext) return "application/octet-stream";
-    if (strcmp(ext, ".html") == 0) return "text/html; charset=utf-8";
+    if (strcmp(ext, ".html") == 0 || strcmp(ext, ".htm") == 0) return "text/html; charset=utf-8";
     if (strcmp(ext, ".css") == 0) return "text/css; charset=utf-8";
     if (strcmp(ext, ".js") == 0) return "application/javascript; charset=utf-8";
     if (strcmp(ext, ".png") == 0) return "image/png";
