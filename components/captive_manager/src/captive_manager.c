@@ -6,6 +6,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_http_server.h"
+#include "esp_http_client.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_system.h"
@@ -21,6 +22,8 @@
 #include <time.h>
 #include <ctype.h>
 #include <sys/time.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 static const char *TAG = "wifi_manager";
 
@@ -814,7 +817,145 @@ static esp_err_t lecturas_get(httpd_req_t *r) {
 }
 
 
+
+static bool safe_web_asset_name(const char *name) {
+    if (!name || !name[0] || strlen(name) > 48) return false;
+    if (strstr(name, "..") || strchr(name, '/') || strchr(name, '\\')) return false;
+    for (const char *p = name; *p; ++p) {
+        if (!(isalnum((unsigned char)*p) || *p == '.' || *p == '_' || *p == '-')) return false;
+    }
+    return true;
+}
+
+static const char *web_asset_content_type(const char *name) {
+    const char *ext = strrchr(name ? name : "", '.');
+    if (!ext) return "application/octet-stream";
+    if (strcmp(ext, ".html") == 0) return "text/html; charset=utf-8";
+    if (strcmp(ext, ".css") == 0) return "text/css; charset=utf-8";
+    if (strcmp(ext, ".js") == 0) return "application/javascript; charset=utf-8";
+    if (strcmp(ext, ".png") == 0) return "image/png";
+    return "application/octet-stream";
+}
+
+static bool serve_sd_web_file(httpd_req_t *r, const char *name) {
+    if (!sd_store_is_ready() || !safe_web_asset_name(name)) return false;
+
+    char path[96];
+    snprintf(path, sizeof(path), "/sdcard/web/%s", name);
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+
+    httpd_resp_set_type(r, web_asset_content_type(name));
+    char chunk[1024];
+    size_t n = 0;
+    while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) {
+        if (httpd_resp_send_chunk(r, chunk, n) != ESP_OK) {
+            fclose(f);
+            httpd_resp_send_chunk(r, NULL, 0);
+            return true;
+        }
+    }
+    fclose(f);
+    httpd_resp_send_chunk(r, NULL, 0);
+    return true;
+}
+
+static esp_err_t sd_web_asset_get(httpd_req_t *r, const char *name) {
+    if (serve_sd_web_file(r, name)) return ESP_OK;
+    return httpd_resp_send_err(r, 404, "web asset not found");
+}
+
+static esp_err_t sd_style_get(httpd_req_t *r) { return sd_web_asset_get(r, "style.css"); }
+static esp_err_t sd_script_get(httpd_req_t *r) { return sd_web_asset_get(r, "script.js"); }
+static esp_err_t sd_logo_get(httpd_req_t *r) { return sd_web_asset_get(r, "Recurso2.png"); }
+
+static esp_err_t ensure_sd_web_dir(void) {
+    if (!sd_store_is_ready()) return ESP_ERR_INVALID_STATE;
+    if (mkdir("/sdcard/web", 0775) != 0 && errno != EEXIST) {
+        ESP_LOGE(TAG, "No se pudo crear /sdcard/web errno=%d (%s)", errno, strerror(errno));
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t download_web_asset_to_sd(const char *url, const char *name, size_t *out_bytes) {
+    if (!url || !url[0] || !safe_web_asset_name(name)) return ESP_ERR_INVALID_ARG;
+    if (ensure_sd_web_dir() != ESP_OK) return ESP_ERR_INVALID_STATE;
+
+    char final_path[96];
+    char temp_path[112];
+    snprintf(final_path, sizeof(final_path), "/sdcard/web/%s", name);
+    snprintf(temp_path, sizeof(temp_path), "/sdcard/web/%s.tmp", name);
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .timeout_ms = 15000,
+        .buffer_size = 1024,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) return ESP_ERR_NO_MEM;
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        esp_http_client_cleanup(client);
+        return err;
+    }
+
+    (void)esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    if (status && (status < 200 || status >= 300)) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        ESP_LOGW(TAG, "HTTP asset %s status=%d", name, status);
+        return ESP_FAIL;
+    }
+
+    FILE *f = fopen(temp_path, "wb");
+    if (!f) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        ESP_LOGE(TAG, "No se pudo abrir %s errno=%d (%s)", temp_path, errno, strerror(errno));
+        return ESP_FAIL;
+    }
+
+    size_t total = 0;
+    char buffer[1024];
+    while (1) {
+        int read_len = esp_http_client_read(client, buffer, sizeof(buffer));
+        if (read_len < 0) {
+            err = ESP_FAIL;
+            break;
+        }
+        if (read_len == 0) {
+            break;
+        }
+        if (fwrite(buffer, 1, read_len, f) != (size_t)read_len) {
+            err = ESP_FAIL;
+            break;
+        }
+        total += (size_t)read_len;
+    }
+
+    fclose(f);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK) {
+        remove(temp_path);
+        return err;
+    }
+    if (rename(temp_path, final_path) != 0) {
+        remove(temp_path);
+        return ESP_FAIL;
+    }
+    if (out_bytes) *out_bytes = total;
+    ESP_LOGI(TAG, "Asset web guardado en SD: %s (%u bytes)", final_path, (unsigned)total);
+    return ESP_OK;
+}
+
 static esp_err_t tabla_get(httpd_req_t *r) {
+    if (serve_sd_web_file(r, "index.html")) return ESP_OK;
+
     const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
 
     httpd_resp_set_type(r, "text/html; charset=utf-8");
@@ -1144,6 +1285,87 @@ static esp_err_t config_post(httpd_req_t *r) {
     return ESP_OK;
 }
 
+
+static esp_err_t web_update_post(httpd_req_t *r) {
+    if (!g_sta_have_ip) {
+        return httpd_resp_send_err(r, 409, "network not ready");
+    }
+    if (!sd_store_is_ready()) {
+        return httpd_resp_send_err(r, 409, "sd not ready");
+    }
+    if (r->content_len <= 0 || r->content_len >= 4096) {
+        return httpd_resp_send_err(r, 400, "invalid payload size");
+    }
+
+    char *buf = calloc(1, r->content_len + 1);
+    if (!buf) return httpd_resp_send_err(r, 500, "no memory");
+    int total_read = 0;
+    while (total_read < r->content_len) {
+        int received = httpd_req_recv(r, buf + total_read, r->content_len - total_read);
+        if (received <= 0) {
+            free(buf);
+            return httpd_resp_send_err(r, 400, "payload read failed");
+        }
+        total_read += received;
+    }
+    buf[total_read] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) return httpd_resp_send_err(r, 400, "json");
+
+    cJSON *j_device_id = cJSON_GetObjectItem(root, "device_id");
+    const char *expected_device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
+    if (cJSON_IsString(j_device_id) && strcmp(j_device_id->valuestring, expected_device_id) != 0) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(r, 400, "device_id mismatch");
+    }
+
+    cJSON *files = cJSON_GetObjectItem(root, "files");
+    if (!cJSON_IsArray(files)) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(r, 400, "files array required");
+    }
+
+    int saved = 0;
+    int failed = 0;
+    cJSON *details = cJSON_CreateArray();
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, files) {
+        cJSON *j_name = cJSON_GetObjectItem(item, "name");
+        cJSON *j_url = cJSON_GetObjectItem(item, "url");
+        if (!cJSON_IsString(j_name) || !cJSON_IsString(j_url)) {
+            failed++;
+            continue;
+        }
+        size_t bytes = 0;
+        esp_err_t err = download_web_asset_to_sd(j_url->valuestring, j_name->valuestring, &bytes);
+        cJSON *row = cJSON_CreateObject();
+        cJSON_AddStringToObject(row, "name", j_name->valuestring);
+        cJSON_AddBoolToObject(row, "ok", err == ESP_OK);
+        cJSON_AddNumberToObject(row, "bytes", (double)bytes);
+        if (err != ESP_OK) cJSON_AddStringToObject(row, "error", esp_err_to_name(err));
+        cJSON_AddItemToArray(details, row);
+        if (err == ESP_OK) saved++; else failed++;
+    }
+
+    cJSON *out = cJSON_CreateObject();
+    cJSON_AddBoolToObject(out, "ok", failed == 0);
+    cJSON_AddStringToObject(out, "device_id", expected_device_id);
+    cJSON_AddNumberToObject(out, "saved", saved);
+    cJSON_AddNumberToObject(out, "failed", failed);
+    cJSON_AddNumberToObject(out, "total", cJSON_GetArraySize(files));
+    cJSON_AddItemToObject(out, "files", details);
+    char *text = cJSON_PrintUnformatted(out);
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_status(r, failed == 0 ? "200 OK" : "500 Internal Server Error");
+    httpd_resp_sendstr(r, text);
+    free(text);
+    cJSON_Delete(out);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
 static esp_err_t ota_status_get(httpd_req_t *r) {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "device_id", (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor");
@@ -1231,6 +1453,10 @@ static httpd_uri_t uri_save             = { .uri="/save",        .method=HTTP_PO
 static httpd_uri_t uri_status           = { .uri="/status",      .method=HTTP_GET,    .handler=status_get };
 static httpd_uri_t uri_lecturas         = { .uri="/lecturas",    .method=HTTP_GET,    .handler=lecturas_get };
 static httpd_uri_t uri_tabla            = { .uri="/tabla",       .method=HTTP_GET,    .handler=tabla_get };
+static httpd_uri_t uri_api_latest       = { .uri="/api/latest",  .method=HTTP_GET,    .handler=lecturas_get };
+static httpd_uri_t uri_web_style        = { .uri="/style.css",    .method=HTTP_GET,    .handler=sd_style_get };
+static httpd_uri_t uri_web_script       = { .uri="/script.js",    .method=HTTP_GET,    .handler=sd_script_get };
+static httpd_uri_t uri_web_logo         = { .uri="/Recurso2.png", .method=HTTP_GET,    .handler=sd_logo_get };
 static httpd_uri_t uri_lecturas_since   = { .uri="/lecturas/since", .method=HTTP_GET,  .handler=lecturas_since_get };
 static httpd_uri_t uri_lecturas_range   = { .uri="/lecturas/range", .method=HTTP_GET, .handler=lecturas_range_get };
 static httpd_uri_t uri_lecturas_recent  = { .uri="/lecturas/recent", .method=HTTP_GET, .handler=lecturas_recent_get };
@@ -1242,13 +1468,14 @@ static httpd_uri_t uri_readings_clr     = { .uri="/lecturas/clear", .method=HTTP
 static httpd_uri_t uri_readings_clr_get = { .uri="/lecturas/clear", .method=HTTP_GET,    .handler=readings_clear_get };
 static httpd_uri_t uri_ota_update       = { .uri="/ota/update", .method=HTTP_POST, .handler=ota_update_post };
 static httpd_uri_t uri_ota_status       = { .uri="/ota/status", .method=HTTP_GET, .handler=ota_status_get };
+static httpd_uri_t uri_web_update       = { .uri="/web/update", .method=HTTP_POST, .handler=web_update_post };
 
 static esp_err_t start_http(void) {
     if (g_server) return ESP_OK;
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.max_open_sockets = 2;
-    cfg.max_uri_handlers = 20;
+    cfg.max_uri_handlers = 30;
     cfg.stack_size = 8192;
     cfg.lru_purge_enable = true;
 
@@ -1260,6 +1487,10 @@ static esp_err_t start_http(void) {
         httpd_register_uri_handler(g_server, &uri_status);
         httpd_register_uri_handler(g_server, &uri_lecturas);
         httpd_register_uri_handler(g_server, &uri_tabla);
+        httpd_register_uri_handler(g_server, &uri_api_latest);
+        httpd_register_uri_handler(g_server, &uri_web_style);
+        httpd_register_uri_handler(g_server, &uri_web_script);
+        httpd_register_uri_handler(g_server, &uri_web_logo);
         httpd_register_uri_handler(g_server, &uri_lecturas_since);
         httpd_register_uri_handler(g_server, &uri_lecturas_range);
         httpd_register_uri_handler(g_server, &uri_lecturas_recent);
@@ -1271,6 +1502,7 @@ static esp_err_t start_http(void) {
         httpd_register_uri_handler(g_server, &uri_readings_clr_get);
         httpd_register_uri_handler(g_server, &uri_ota_update);
         httpd_register_uri_handler(g_server, &uri_ota_status);
+        httpd_register_uri_handler(g_server, &uri_web_update);
         return ESP_OK;
     }
 
