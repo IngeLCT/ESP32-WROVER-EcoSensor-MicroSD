@@ -1,0 +1,35 @@
+html {
+    font-family: "Arial Narrow", Arial, sans-serif;
+    text-align: center;
+}
+
+body {
+    background-color: #cce5dc;
+    padding: 10%;
+}
+
+h1 {
+    color: rgb(4, 87, 9);
+    font-size: 25px;
+}
+
+h2 {
+    color: rgb(4, 4, 52);
+    text-decoration: underline;
+}
+
+table {
+    width: 100%;
+}
+
+th,
+td {
+    font-size: 25px;
+    text-align: center;
+    border: 1px solid black;
+    border-radius: 10px;
+}
+
+th {
+    background-color: #80ffd4;
+}

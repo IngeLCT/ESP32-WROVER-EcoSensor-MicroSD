@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>EcoSensor</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" type="text/css" href="style.css">
+</head>
+<body>
+    <h1>LCT Didacticos</h1><img src="Recurso2.png" width="80">
+    <h2 EcoSensor="ID"></h2>
+    <table>
+        <tr>
+            <th>Mediciones</th>
+            <th>Valor</th>
+            <th>Unidad</th>
+        </tr>
+        <tr>
+            <td>PM1.0</td>
+            <td><span id="pm1"></span></td>
+            <td>ug/m3</td>
+        </tr>
+        <tr>
+            <td>PM2.5</td>
+            <td><span id="pm25"></span></td>
+            <td>ug/m3</td>
+        </tr>
+        <tr>
+            <td>PM4.0</td>
+            <td><span id="pm4"></span></td>
+            <td>ug/m3</td>
+        </tr>
+        <tr>
+            <td>PM10.0</td>
+            <td><span id="pm10"></span></td>
+            <td>ug/m3</td>
+        </tr>
+        <tr>
+            <td>VOC</td>
+            <td><span id="voc"></span></td>
+            <td>Index</td>
+        </tr>
+        <tr>
+            <td>NOx</td>
+            <td><span id="nox"></span></td>
+            <td>Index</td>
+        </tr>
+        <tr>
+            <td>CO2</td>
+            <td><span id="co2"></span></td>
+            <td>ppm</td>
+        </tr>
+        <tr>
+            <td>Temperatura</td>
+            <td><span id="temp"></span></td>
+            <td>°C</td>
+        </tr>
+        <tr>
+            <td>Humedad Relativa</td>
+            <td><span id="hume"></span></td>
+            <td>%</td>
+        </tr>
+    </table>
+
+    <p class="last-date">Fecha de última medición: <span id="last-date"></span></p>
+    <p class="last-time">Hora última medición: <span id="last-time"></span></p>
+
+    <script src="script.js"></script>
+</body>
+</html>
