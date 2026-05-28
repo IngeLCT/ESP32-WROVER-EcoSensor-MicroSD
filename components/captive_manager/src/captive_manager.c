@@ -999,6 +999,12 @@ static esp_err_t tabla_get(httpd_req_t *r) {
     if (serve_sd_web_file(r, "in.htm")) return ESP_OK;
 
     const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
+    char display_id[64];
+    if (strncmp(device_id, "ecosensor", 9) == 0) {
+        snprintf(display_id, sizeof(display_id), "EcoSensor%s", device_id + 9);
+    } else {
+        snprintf(display_id, sizeof(display_id), "%s", device_id);
+    }
 
     httpd_resp_set_type(r, "text/html; charset=utf-8");
     httpd_resp_send_chunk(r,
@@ -1022,7 +1028,7 @@ static esp_err_t tabla_get(httpd_req_t *r) {
 
     httpd_resp_send_chunk(r, "<h1>LCT Didacticos</h1>", -1);
     char buf[256];
-    snprintf(buf, sizeof(buf), "<h2>ID: %s</h2>", device_id);
+    snprintf(buf, sizeof(buf), "<h2>ID: %s</h2>", display_id);
     httpd_resp_send_chunk(r, buf, -1);
 
     if (!g_last_readings.valid) {
