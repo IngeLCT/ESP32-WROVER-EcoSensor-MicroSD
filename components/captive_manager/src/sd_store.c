@@ -8,6 +8,7 @@
 #include "sdmmc_cmd.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -19,6 +20,7 @@ static const char *TAG = "sd_store";
 static const char *MOUNT_POINT = "/sdcard";
 static const char *CSV_PATH = "/sdcard/data.csv";
 static const char *CSV_HEADER = "id,boot_id,uptime_s,time_valid,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,scd_temp,scd_hum,sen_temp,sen_hum,window_s\n";
+#define STREAM_EXPORT_BATCH_ROWS 64
 
 static bool g_ready = false;
 static uint32_t g_last_id = 0;
@@ -720,52 +722,86 @@ esp_err_t sd_store_stream_readings_range_ndjson(uint32_t from_id, uint32_t to_id
         timeout_ms = 120000;
     }
 
-    if (g_lock && xSemaphoreTake(g_lock, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-    FILE *f = fopen(CSV_PATH, "r");
-    if (!f) {
-        if (g_lock) xSemaphoreGive(g_lock);
-        return ESP_FAIL;
+    sd_store_row_t *batch = calloc(STREAM_EXPORT_BATCH_ROWS, sizeof(sd_store_row_t));
+    if (!batch) {
+        return ESP_ERR_NO_MEM;
     }
 
-    long start_offset = get_id_offset(start_id);
-    if (start_offset >= 0 && fseek(f, start_offset, SEEK_SET) != 0) {
-        ESP_LOGW(TAG, "No se pudo posicionar CSV export en id=%lu offset=%ld", (unsigned long)start_id, start_offset);
-        rewind(f);
-    }
-
-    char line[320];
+    uint32_t next_id = start_id;
     uint32_t count = 0;
     uint32_t scanned_rows = 0;
     esp_err_t result = ESP_OK;
     int64_t started_us = esp_timer_get_time();
-    while (fgets(line, sizeof(line), f)) {
-        if ((scanned_rows & 0x0F) == 0 && scan_timed_out(started_us, timeout_ms)) {
+
+    while (next_id <= end_id) {
+        if (scan_timed_out(started_us, timeout_ms)) {
             result = ESP_ERR_TIMEOUT;
             break;
         }
-        sd_store_row_t parsed = {0};
-        if (!parse_csv_line(line, &parsed)) {
-            continue;
-        }
-        scanned_rows++;
-        if (parsed.id < start_id) {
-            continue;
-        }
-        if (parsed.id > end_id) {
+
+        uint32_t batch_count = 0;
+        bool reached_end = false;
+
+        if (g_lock && xSemaphoreTake(g_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            result = ESP_ERR_TIMEOUT;
             break;
         }
 
-        result = write_row_ndjson(&parsed, writer, ctx);
-        if (result != ESP_OK) {
+        FILE *f = fopen(CSV_PATH, "r");
+        if (!f) {
+            result = ESP_FAIL;
+            if (g_lock) xSemaphoreGive(g_lock);
             break;
         }
-        count++;
+
+        long start_offset = get_id_offset(next_id);
+        if (start_offset >= 0 && fseek(f, start_offset, SEEK_SET) != 0) {
+            ESP_LOGW(TAG, "No se pudo posicionar CSV export en id=%lu offset=%ld", (unsigned long)next_id, start_offset);
+            rewind(f);
+        }
+
+        char line[320];
+        while (batch_count < STREAM_EXPORT_BATCH_ROWS && fgets(line, sizeof(line), f)) {
+            if ((scanned_rows & 0x0F) == 0 && scan_timed_out(started_us, timeout_ms)) {
+                result = ESP_ERR_TIMEOUT;
+                reached_end = true;
+                break;
+            }
+            sd_store_row_t parsed = {0};
+            if (!parse_csv_line(line, &parsed)) {
+                continue;
+            }
+            scanned_rows++;
+            if (parsed.id < next_id) {
+                continue;
+            }
+            if (parsed.id > end_id) {
+                reached_end = true;
+                break;
+            }
+            batch[batch_count++] = parsed;
+            next_id = parsed.id + 1;
+        }
+
+        if (fclose(f) != 0 && result == ESP_OK) {
+            result = ESP_FAIL;
+        }
+        if (g_lock) xSemaphoreGive(g_lock);
+
+        for (uint32_t i = 0; i < batch_count && result == ESP_OK; ++i) {
+            result = write_row_ndjson(&batch[i], writer, ctx);
+            if (result == ESP_OK) {
+                count++;
+            }
+        }
+
+        if (result != ESP_OK || reached_end || batch_count == 0) {
+            break;
+        }
+        vTaskDelay(1);
     }
-    fclose(f);
-    if (g_lock) xSemaphoreGive(g_lock);
 
+    free(batch);
     if (added) {
         *added = count;
     }
