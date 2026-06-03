@@ -514,6 +514,55 @@ static void add_row_json(cJSON *array, const sd_store_row_t *parsed) {
     cJSON_AddItemToArray(array, row);
 }
 
+static esp_err_t write_row_ndjson(const sd_store_row_t *parsed, sd_store_ndjson_writer_t writer, void *ctx) {
+    if (!parsed || !writer) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char timestamp_field[96];
+    if (parsed->timestamp[0]) {
+        snprintf(timestamp_field, sizeof(timestamp_field), "\"%s\"", parsed->timestamp);
+    } else {
+        snprintf(timestamp_field, sizeof(timestamp_field), "null");
+    }
+
+    char line[640];
+    int len = snprintf(
+        line,
+        sizeof(line),
+        "{\"id\":%lu,\"measurement_id\":%lu,\"boot_id\":%lu,\"uptime_s\":%lu,"
+        "\"time_valid\":%s,\"time_source\":\"%s\",\"timestamp\":%s,"
+        "\"co2\":%lu,\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
+        "\"voc\":%.2f,\"nox\":%.2f,\"temp\":%.2f,\"hum\":%.2f,"
+        "\"scd_temp\":%.2f,\"scd_hum\":%.2f,\"sen_temp\":%.2f,\"sen_hum\":%.2f,\"window_s\":%lu}\n",
+        (unsigned long)parsed->id,
+        (unsigned long)parsed->id,
+        (unsigned long)parsed->boot_id,
+        (unsigned long)parsed->uptime_s,
+        parsed->time_valid ? "true" : "false",
+        parsed->time_valid ? "esp" : "pending_estimate",
+        timestamp_field,
+        (unsigned long)parsed->co2,
+        parsed->pm1p0,
+        parsed->pm2p5,
+        parsed->pm4p0,
+        parsed->pm10p0,
+        parsed->voc,
+        parsed->nox,
+        parsed->temp,
+        parsed->hum,
+        parsed->scd_temp,
+        parsed->scd_hum,
+        parsed->sen_temp,
+        parsed->sen_hum,
+        (unsigned long)parsed->window_s
+    );
+    if (len <= 0 || len >= (int)sizeof(line)) {
+        return ESP_ERR_NO_MEM;
+    }
+    return writer(line, ctx);
+}
+
 static uint32_t normalize_limit(uint32_t limit) {
     if (limit == 0) {
         return 25;
@@ -638,6 +687,80 @@ esp_err_t sd_store_add_readings_range(cJSON *array, uint32_t from_id, uint32_t t
         }
 
         add_row_json(array, &parsed);
+        count++;
+    }
+    fclose(f);
+    if (g_lock) xSemaphoreGive(g_lock);
+
+    if (added) {
+        *added = count;
+    }
+    if (scanned) {
+        *scanned = scanned_rows;
+    }
+    return result;
+}
+
+esp_err_t sd_store_stream_readings_range_ndjson(uint32_t from_id, uint32_t to_id, uint32_t timeout_ms, sd_store_ndjson_writer_t writer, void *ctx, uint32_t *added, uint32_t *scanned) {
+    if (!g_ready || !writer) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (from_id == 0 || to_id == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint32_t start_id = from_id < to_id ? from_id : to_id;
+    uint32_t end_id = from_id > to_id ? from_id : to_id;
+    if (timeout_ms == 0) {
+        timeout_ms = 120000;
+    }
+    if (timeout_ms < 30000) {
+        timeout_ms = 30000;
+    }
+    if (timeout_ms > 120000) {
+        timeout_ms = 120000;
+    }
+
+    if (g_lock && xSemaphoreTake(g_lock, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    FILE *f = fopen(CSV_PATH, "r");
+    if (!f) {
+        if (g_lock) xSemaphoreGive(g_lock);
+        return ESP_FAIL;
+    }
+
+    long start_offset = get_id_offset(start_id);
+    if (start_offset >= 0 && fseek(f, start_offset, SEEK_SET) != 0) {
+        ESP_LOGW(TAG, "No se pudo posicionar CSV export en id=%lu offset=%ld", (unsigned long)start_id, start_offset);
+        rewind(f);
+    }
+
+    char line[320];
+    uint32_t count = 0;
+    uint32_t scanned_rows = 0;
+    esp_err_t result = ESP_OK;
+    int64_t started_us = esp_timer_get_time();
+    while (fgets(line, sizeof(line), f)) {
+        if ((scanned_rows & 0x0F) == 0 && scan_timed_out(started_us, timeout_ms)) {
+            result = ESP_ERR_TIMEOUT;
+            break;
+        }
+        sd_store_row_t parsed = {0};
+        if (!parse_csv_line(line, &parsed)) {
+            continue;
+        }
+        scanned_rows++;
+        if (parsed.id < start_id) {
+            continue;
+        }
+        if (parsed.id > end_id) {
+            break;
+        }
+
+        result = write_row_ndjson(&parsed, writer, ctx);
+        if (result != ESP_OK) {
+            break;
+        }
         count++;
     }
     fclose(f);

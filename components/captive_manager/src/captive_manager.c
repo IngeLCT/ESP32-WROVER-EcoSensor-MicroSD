@@ -1201,6 +1201,54 @@ static esp_err_t lecturas_range_get(httpd_req_t *r) {
     return ESP_OK;
 }
 
+static esp_err_t ndjson_http_writer(const char *line, void *ctx) {
+    httpd_req_t *req = (httpd_req_t *)ctx;
+    if (!line || !req) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return httpd_resp_send_chunk(req, line, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t lecturas_export_get(httpd_req_t *r) {
+    char query[128] = {0};
+    uint32_t from_id = 0;
+    uint32_t to_id = 0;
+    uint32_t timeout_ms = 120000;
+
+    if (httpd_req_get_url_query_str(r, query, sizeof(query)) == ESP_OK) {
+        char value[24] = {0};
+        if (httpd_query_key_value(query, "from", value, sizeof(value)) == ESP_OK ||
+            httpd_query_key_value(query, "from_id", value, sizeof(value)) == ESP_OK) {
+            from_id = (uint32_t)strtoul(value, NULL, 10);
+        }
+        if (httpd_query_key_value(query, "to", value, sizeof(value)) == ESP_OK ||
+            httpd_query_key_value(query, "to_id", value, sizeof(value)) == ESP_OK) {
+            to_id = (uint32_t)strtoul(value, NULL, 10);
+        }
+        if (httpd_query_key_value(query, "timeout_ms", value, sizeof(value)) == ESP_OK) {
+            timeout_ms = (uint32_t)strtoul(value, NULL, 10);
+        }
+    }
+
+    httpd_resp_set_type(r, "application/x-ndjson");
+    httpd_resp_set_hdr(r, "X-EcoSensor-Format", "ndjson");
+    httpd_resp_set_hdr(r, "X-EcoSensor-Last-Id", "0");
+
+    uint32_t added = 0;
+    uint32_t scanned = 0;
+    esp_err_t err = sd_store_stream_readings_range_ndjson(from_id, to_id, timeout_ms, ndjson_http_writer, r, &added, &scanned);
+    if (err == ESP_OK) {
+        httpd_resp_send_chunk(r, NULL, 0);
+    } else {
+        char error_line[160];
+        snprintf(error_line, sizeof(error_line), "{\"error\":\"%s\",\"count\":%lu,\"scanned\":%lu}\n",
+                 esp_err_to_name(err), (unsigned long)added, (unsigned long)scanned);
+        httpd_resp_send_chunk(r, error_line, HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send_chunk(r, NULL, 0);
+    }
+    return ESP_OK;
+}
+
 static esp_err_t lecturas_recent_get(httpd_req_t *r) {
     char query[128] = {0};
     uint32_t after_id = 0;
@@ -1537,6 +1585,7 @@ static httpd_uri_t uri_web_script       = { .uri="/sc.js",       .method=HTTP_GE
 static httpd_uri_t uri_web_logo         = { .uri="/lct.png",     .method=HTTP_GET,    .handler=sd_logo_get };
 static httpd_uri_t uri_lecturas_since   = { .uri="/lecturas/since", .method=HTTP_GET,  .handler=lecturas_since_get };
 static httpd_uri_t uri_lecturas_range   = { .uri="/lecturas/range", .method=HTTP_GET, .handler=lecturas_range_get };
+static httpd_uri_t uri_lecturas_export  = { .uri="/lecturas/export", .method=HTTP_GET, .handler=lecturas_export_get };
 static httpd_uri_t uri_lecturas_recent  = { .uri="/lecturas/recent", .method=HTTP_GET, .handler=lecturas_recent_get };
 static httpd_uri_t uri_config           = { .uri="/config",      .method=HTTP_POST,   .handler=config_post };
 static httpd_uri_t uri_time             = { .uri="/time",        .method=HTTP_POST,   .handler=config_post };
@@ -1571,6 +1620,7 @@ static esp_err_t start_http(void) {
         httpd_register_uri_handler(g_server, &uri_web_logo);
         httpd_register_uri_handler(g_server, &uri_lecturas_since);
         httpd_register_uri_handler(g_server, &uri_lecturas_range);
+        httpd_register_uri_handler(g_server, &uri_lecturas_export);
         httpd_register_uri_handler(g_server, &uri_lecturas_recent);
         httpd_register_uri_handler(g_server, &uri_config);
         httpd_register_uri_handler(g_server, &uri_time);

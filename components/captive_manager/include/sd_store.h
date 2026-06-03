@@ -23,6 +23,8 @@ esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uin
 esp_err_t sd_store_add_readings_since(cJSON *array, uint32_t after_id, uint32_t limit, uint32_t timeout_ms, uint32_t *added, uint32_t *scanned);
 esp_err_t sd_store_add_recent_readings(cJSON *array, uint32_t after_id, uint32_t before_id, uint32_t limit, uint32_t timeout_ms, uint32_t *added, uint32_t *scanned);
 esp_err_t sd_store_add_readings_range(cJSON *array, uint32_t from_id, uint32_t to_id, uint32_t limit, uint32_t timeout_ms, uint32_t *added, uint32_t *scanned);
+typedef esp_err_t (*sd_store_ndjson_writer_t)(const char *line, void *ctx);
+esp_err_t sd_store_stream_readings_range_ndjson(uint32_t from_id, uint32_t to_id, uint32_t timeout_ms, sd_store_ndjson_writer_t writer, void *ctx, uint32_t *added, uint32_t *scanned);
 esp_err_t sd_store_clear(void);
 
 #ifdef __cplusplus
