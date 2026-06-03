@@ -20,6 +20,7 @@ esp_err_t sd_store_init(void);
 bool sd_store_is_ready(void);
 uint32_t sd_store_last_id(void);
 esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uint32_t *out_id);
+esp_err_t sd_store_add_latest_reading(cJSON *object, uint32_t timeout_ms, bool *found);
 esp_err_t sd_store_add_readings_since(cJSON *array, uint32_t after_id, uint32_t limit, uint32_t timeout_ms, uint32_t *added, uint32_t *scanned);
 esp_err_t sd_store_add_recent_readings(cJSON *array, uint32_t after_id, uint32_t before_id, uint32_t limit, uint32_t timeout_ms, uint32_t *added, uint32_t *scanned);
 esp_err_t sd_store_add_readings_range(cJSON *array, uint32_t from_id, uint32_t to_id, uint32_t limit, uint32_t timeout_ms, uint32_t *added, uint32_t *scanned);

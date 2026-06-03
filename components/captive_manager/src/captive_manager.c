@@ -764,7 +764,12 @@ static esp_err_t status_get(httpd_req_t *r) {
         }
     }
     cJSON_AddStringToObject(root, "sensors", g_sensors_started ? "running" : "waiting");
-    cJSON_AddNumberToObject(root, "last_measurement_id", g_last_readings.measurement_id);
+    uint32_t last_measurement_id = g_last_readings.measurement_id;
+    uint32_t sd_last_id = sd_store_last_id();
+    if (sd_last_id > last_measurement_id) {
+        last_measurement_id = sd_last_id;
+    }
+    cJSON_AddNumberToObject(root, "last_measurement_id", last_measurement_id);
     cJSON_AddNumberToObject(root, "last_measurement_uptime_s", g_last_readings.uptime_s);
     if (g_last_readings.timestamp[0]) {
         cJSON_AddStringToObject(root, "last_measurement_timestamp", g_last_readings.timestamp);
@@ -788,44 +793,63 @@ static esp_err_t status_get(httpd_req_t *r) {
 
 static esp_err_t lecturas_get(httpd_req_t *r) {
     const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
+    uint32_t sd_last_id = sd_store_last_id();
+    bool use_sd_latest = sd_store_is_ready() && sd_last_id > 0 && (!g_last_readings.valid || sd_last_id > g_last_readings.measurement_id);
+
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "device_id", device_id);
     cJSON_AddNumberToObject(root, "boot_id", g_boot_id);
     cJSON_AddNumberToObject(root, "current_uptime_s", (double)(esp_timer_get_time() / 1000000ULL));
     cJSON_AddBoolToObject(root, "ok", true);
-    cJSON_AddBoolToObject(root, "valid", g_last_readings.valid);
     cJSON_AddBoolToObject(root, "sd_ready", sd_store_is_ready());
-    cJSON_AddNumberToObject(root, "sd_last_id", sd_store_last_id());
-    cJSON_AddNumberToObject(root, "window_s", g_last_readings.window_s);
+    cJSON_AddNumberToObject(root, "sd_last_id", sd_last_id);
 
-    if (!g_last_readings.valid) {
-        cJSON_AddBoolToObject(root, "time_valid", g_time_valid);
-        cJSON_AddStringToObject(root, "message", "Sin lecturas promediadas disponibles");
-    } else {
-        cJSON_AddNumberToObject(root, "id", g_last_readings.measurement_id);
-        cJSON_AddNumberToObject(root, "measurement_id", g_last_readings.measurement_id);
-        cJSON_AddNumberToObject(root, "boot_id", g_last_readings.boot_id);
-        cJSON_AddNumberToObject(root, "uptime_s", g_last_readings.uptime_s);
-        cJSON_AddBoolToObject(root, "time_valid", g_last_readings.time_valid);
-        cJSON_AddStringToObject(root, "time_source", g_last_readings.time_valid ? "esp" : "pending_estimate");
-        if (g_last_readings.timestamp[0]) {
-            cJSON_AddStringToObject(root, "timestamp", g_last_readings.timestamp);
+    if (use_sd_latest) {
+        bool found = false;
+        esp_err_t err = sd_store_add_latest_reading(root, 1500, &found);
+        if (err == ESP_OK && found) {
+            cJSON_AddBoolToObject(root, "valid", true);
+            cJSON_AddStringToObject(root, "latest_source", "sd");
         } else {
-            cJSON_AddNullToObject(root, "timestamp");
+            ESP_LOGW(TAG, "No se pudo leer latest desde SD id=%lu err=%s found=%d", (unsigned long)sd_last_id, esp_err_to_name(err), found);
+            use_sd_latest = false;
         }
-        cJSON_AddNumberToObject(root, "co2", g_last_readings.co2);
-        cJSON_AddNumberToObject(root, "pm1p0", g_last_readings.pm1p0);
-        cJSON_AddNumberToObject(root, "pm2p5", g_last_readings.pm2p5);
-        cJSON_AddNumberToObject(root, "pm4p0", g_last_readings.pm4p0);
-        cJSON_AddNumberToObject(root, "pm10p0", g_last_readings.pm10p0);
-        cJSON_AddNumberToObject(root, "voc", g_last_readings.voc);
-        cJSON_AddNumberToObject(root, "nox", g_last_readings.nox);
-        cJSON_AddNumberToObject(root, "temp", g_last_readings.temp);
-        cJSON_AddNumberToObject(root, "hum", g_last_readings.hum);
-        cJSON_AddNumberToObject(root, "scd_temp", g_last_readings.scd_temp);
-        cJSON_AddNumberToObject(root, "scd_hum", g_last_readings.scd_hum);
-        cJSON_AddNumberToObject(root, "sen_temp", g_last_readings.sen_temp);
-        cJSON_AddNumberToObject(root, "sen_hum", g_last_readings.sen_hum);
+    }
+
+    if (!use_sd_latest) {
+        cJSON_AddBoolToObject(root, "valid", g_last_readings.valid);
+        cJSON_AddNumberToObject(root, "window_s", g_last_readings.window_s);
+
+        if (!g_last_readings.valid) {
+            cJSON_AddBoolToObject(root, "time_valid", g_time_valid);
+            cJSON_AddStringToObject(root, "message", "Sin lecturas promediadas disponibles");
+        } else {
+            cJSON_AddStringToObject(root, "latest_source", "ram");
+            cJSON_AddNumberToObject(root, "id", g_last_readings.measurement_id);
+            cJSON_AddNumberToObject(root, "measurement_id", g_last_readings.measurement_id);
+            cJSON_AddNumberToObject(root, "boot_id", g_last_readings.boot_id);
+            cJSON_AddNumberToObject(root, "uptime_s", g_last_readings.uptime_s);
+            cJSON_AddBoolToObject(root, "time_valid", g_last_readings.time_valid);
+            cJSON_AddStringToObject(root, "time_source", g_last_readings.time_valid ? "esp" : "pending_estimate");
+            if (g_last_readings.timestamp[0]) {
+                cJSON_AddStringToObject(root, "timestamp", g_last_readings.timestamp);
+            } else {
+                cJSON_AddNullToObject(root, "timestamp");
+            }
+            cJSON_AddNumberToObject(root, "co2", g_last_readings.co2);
+            cJSON_AddNumberToObject(root, "pm1p0", g_last_readings.pm1p0);
+            cJSON_AddNumberToObject(root, "pm2p5", g_last_readings.pm2p5);
+            cJSON_AddNumberToObject(root, "pm4p0", g_last_readings.pm4p0);
+            cJSON_AddNumberToObject(root, "pm10p0", g_last_readings.pm10p0);
+            cJSON_AddNumberToObject(root, "voc", g_last_readings.voc);
+            cJSON_AddNumberToObject(root, "nox", g_last_readings.nox);
+            cJSON_AddNumberToObject(root, "temp", g_last_readings.temp);
+            cJSON_AddNumberToObject(root, "hum", g_last_readings.hum);
+            cJSON_AddNumberToObject(root, "scd_temp", g_last_readings.scd_temp);
+            cJSON_AddNumberToObject(root, "scd_hum", g_last_readings.scd_hum);
+            cJSON_AddNumberToObject(root, "sen_temp", g_last_readings.sen_temp);
+            cJSON_AddNumberToObject(root, "sen_hum", g_last_readings.sen_hum);
+        }
     }
 
     char *out = cJSON_PrintUnformatted(root);
@@ -866,6 +890,8 @@ static bool serve_sd_web_file(httpd_req_t *r, const char *name) {
     if (!f) return false;
 
     httpd_resp_set_type(r, web_asset_content_type(name));
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    httpd_resp_set_hdr(r, "Pragma", "no-cache");
     char chunk[1024];
     size_t n = 0;
     while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) {
@@ -1035,7 +1061,10 @@ static esp_err_t tabla_get(httpd_req_t *r) {
         "<style>"
         "html{font-family:Arial Narrow,Arial,sans-serif;text-align:center}"
         "body{background-color:#cce5dc;padding:10%;margin:0}"
-        "h1{color:rgb(4,87,9);font-size:25px;margin:0 0 12px}"
+        ".brand{display:flex;align-items:center;justify-content:center;gap:12px;margin:0 0 14px}"
+        ".brand img{width:80px;height:80px;object-fit:contain}"
+        ".brand-title{color:rgb(4,87,9);font-size:25px;font-weight:700}"
+        ".brand-title sup{font-size:11px;margin-left:1px}"
         "h2{color:rgb(4,4,52);text-decoration:underline;margin:10px 0}"
         "p{font-size:18px;color:rgb(4,4,52)}"
         "table{width:100%;border-spacing:0;border-collapse:separate;margin-top:20px}"
@@ -1045,7 +1074,7 @@ static esp_err_t tabla_get(httpd_req_t *r) {
         "@media(max-width:640px){body{padding:6%}th,td{font-size:18px;padding:7px}h1{font-size:23px}h2{font-size:20px}p{font-size:16px}}"
         "</style></head><body>", -1);
 
-    httpd_resp_send_chunk(r, "<h1>LCT Didacticos</h1>", -1);
+    httpd_resp_send_chunk(r, "<div class=\"brand\"><img src=\"lct.png\" alt=\"LCT Didacticos\"><div class=\"brand-title\">EcoSensor<sup>&reg;</sup></div></div>", -1);
     char buf[256];
     snprintf(buf, sizeof(buf), "<h2>ID: %s</h2>", display_id);
     httpd_resp_send_chunk(r, buf, -1);

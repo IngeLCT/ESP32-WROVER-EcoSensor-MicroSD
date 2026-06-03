@@ -486,8 +486,7 @@ static bool parse_csv_line(const char *line, sd_store_row_t *row) {
     return false;
 }
 
-static void add_row_json(cJSON *array, const sd_store_row_t *parsed) {
-    cJSON *row = cJSON_CreateObject();
+static void add_row_fields(cJSON *row, const sd_store_row_t *parsed) {
     cJSON_AddNumberToObject(row, "id", parsed->id);
     cJSON_AddNumberToObject(row, "measurement_id", parsed->id);
     cJSON_AddNumberToObject(row, "boot_id", parsed->boot_id);
@@ -513,6 +512,11 @@ static void add_row_json(cJSON *array, const sd_store_row_t *parsed) {
     cJSON_AddNumberToObject(row, "sen_temp", parsed->sen_temp);
     cJSON_AddNumberToObject(row, "sen_hum", parsed->sen_hum);
     cJSON_AddNumberToObject(row, "window_s", parsed->window_s);
+}
+
+static void add_row_json(cJSON *array, const sd_store_row_t *parsed) {
+    cJSON *row = cJSON_CreateObject();
+    add_row_fields(row, parsed);
     cJSON_AddItemToArray(array, row);
 }
 
@@ -587,6 +591,72 @@ static uint32_t normalize_timeout_ms(uint32_t timeout_ms) {
 
 static bool scan_timed_out(int64_t started_us, uint32_t timeout_ms) {
     return (esp_timer_get_time() - started_us) > ((int64_t)timeout_ms * 1000LL);
+}
+
+esp_err_t sd_store_add_latest_reading(cJSON *object, uint32_t timeout_ms, bool *found) {
+    if (found) {
+        *found = false;
+    }
+    if (!g_ready || !object) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    timeout_ms = normalize_timeout_ms(timeout_ms);
+
+    uint32_t target_id = g_last_id;
+    if (target_id == 0) {
+        return ESP_OK;
+    }
+
+    if (g_lock && xSemaphoreTake(g_lock, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    FILE *f = fopen(CSV_PATH, "r");
+    if (!f) {
+        if (g_lock) xSemaphoreGive(g_lock);
+        return ESP_FAIL;
+    }
+
+    long start_offset = get_id_offset(target_id);
+    if (start_offset >= 0 && fseek(f, start_offset, SEEK_SET) != 0) {
+        ESP_LOGW(TAG, "No se pudo posicionar CSV para latest id=%lu offset=%ld", (unsigned long)target_id, start_offset);
+        rewind(f);
+    } else if (start_offset < 0) {
+        rewind(f);
+    }
+
+    char line[320];
+    sd_store_row_t latest = {0};
+    bool have_latest = false;
+    int64_t started_us = esp_timer_get_time();
+    while (fgets(line, sizeof(line), f)) {
+        if (scan_timed_out(started_us, timeout_ms)) {
+            fclose(f);
+            if (g_lock) xSemaphoreGive(g_lock);
+            return ESP_ERR_TIMEOUT;
+        }
+        sd_store_row_t parsed = {0};
+        if (!parse_csv_line(line, &parsed)) {
+            continue;
+        }
+        if (parsed.id > target_id) {
+            break;
+        }
+        latest = parsed;
+        have_latest = true;
+        if (parsed.id == target_id) {
+            break;
+        }
+    }
+    fclose(f);
+    if (g_lock) xSemaphoreGive(g_lock);
+
+    if (have_latest) {
+        add_row_fields(object, &latest);
+        if (found) {
+            *found = true;
+        }
+    }
+    return ESP_OK;
 }
 
 esp_err_t sd_store_add_readings_since(cJSON *array, uint32_t after_id, uint32_t limit, uint32_t timeout_ms, uint32_t *added, uint32_t *scanned) {
