@@ -10,6 +10,7 @@
 #include "esp_ota_ops.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 #include "captive_manager.h"
@@ -19,8 +20,8 @@
 static const char *TAG = "EcoSensor";
 
 static const char *MDNS_HOSTNAME = "ecosensor03";
-static const char *AP_SSID = "EcoSensor-03";
-static const char *AP_PASS = "LCT3180940";
+static const char *AP_SSID = "EcoSensor03";
+static const char *AP_PASS = "LCTECO03";
 
 // Offset EcoSensor01: SCD40 = 7.70 SEN55 = -3.02
 // Offset EcoSensor02: SCD40 = 7.70 SEN55 = -3.02
@@ -28,24 +29,21 @@ static const char *AP_PASS = "LCT3180940";
 const float ECO_SCD40_TEMP_OFFSET_C = 13.07f;
 const float ECO_SEN55_TEMP_OFFSET_C = -3.02f;
 
-#define LOG_EACH_SAMPLE          1
+#define LOG_EACH_SAMPLE          0
 #define SENSOR_TASK_STACK        8192
 #define SENSOR_START_TASK_STACK  4096
-#define SAMPLE_DELAY_MS          5000
-#define SAMPLES_PER_AVG_WINDOW   60
+#define SAMPLE_DELAY_MS          30000
+#define SAMPLES_PER_AVG_WINDOW   10
 #define SEN51_VOC_NOX_WARMUP_MS  120000
 #define BOARD_POWERON_PIN        GPIO_NUM_12
 
 #define MEASUREMENT_PUSH_ENDPOINT      "http://ecosensor-servidor.local:8765/api/measurements/push"
 #define MEASUREMENT_PUSH_PORT          8765
 #define MEASUREMENT_PUSH_PATH          "/api/measurements/push"
-#define MEASUREMENT_PUSH_TIMEOUT_MS    1200
+#define MEASUREMENT_PUSH_TIMEOUT_MS    3000
 #define MEASUREMENT_PUSH_TASK_STACK    6144
+#define MEASUREMENT_PUSH_QUEUE_LENGTH   6
 
-
-typedef struct {
-    captive_manager_readings_t reading;
-} measurement_push_ctx_t;
 
 static void wifi_event_handler(void *arg,
                                esp_event_base_t base,
@@ -60,6 +58,8 @@ static void wifi_event_handler(void *arg,
 }
 
 static TaskHandle_t s_sensor_task_handle = NULL;
+static TaskHandle_t s_push_task_handle = NULL;
+static QueueHandle_t s_measurement_push_queue = NULL;
 static bool s_sensors_started = false;
 
 static esp_err_t post_measurement_payload(const captive_manager_readings_t *reading) {
@@ -144,61 +144,60 @@ static esp_err_t post_measurement_payload(const captive_manager_readings_t *read
 }
 
 static void measurement_push_task(void *pv) {
-    measurement_push_ctx_t *ctx = (measurement_push_ctx_t *)pv;
-    if (!ctx) {
-        vTaskDelete(NULL);
-        return;
-    }
+    (void)pv;
 
+    captive_manager_readings_t reading = {0};
     const uint32_t retry_delay_ms[] = {0, 3000, 10000};
     const size_t attempts = sizeof(retry_delay_ms) / sizeof(retry_delay_ms[0]);
-    for (size_t i = 0; i < attempts; i++) {
-        if (retry_delay_ms[i] > 0) {
-            vTaskDelay(pdMS_TO_TICKS(retry_delay_ms[i]));
-        }
-        esp_err_t err = post_measurement_payload(&ctx->reading);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Medicion enviada al servidor id=%lu", (unsigned long)ctx->reading.measurement_id);
-            free(ctx);
-            vTaskDelete(NULL);
-            return;
-        }
-        ESP_LOGW(TAG,
-                 "Push medicion intento %u/%u fallo: %s",
-                 (unsigned)(i + 1),
-                 (unsigned)attempts,
-                 esp_err_to_name(err));
-    }
 
-    ESP_LOGW(TAG,
-             "Medicion id=%lu no enviada tras %u intentos; queda recuperable por sincronizacion SD",
-             (unsigned long)ctx->reading.measurement_id,
-             (unsigned)attempts);
-    free(ctx);
-    vTaskDelete(NULL);
+    while (1) {
+        if (xQueueReceive(s_measurement_push_queue, &reading, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        bool sent = false;
+        for (size_t i = 0; i < attempts; i++) {
+            if (retry_delay_ms[i] > 0) {
+                vTaskDelay(pdMS_TO_TICKS(retry_delay_ms[i]));
+            }
+            esp_err_t err = post_measurement_payload(&reading);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Medicion enviada al servidor id=%lu", (unsigned long)reading.measurement_id);
+                sent = true;
+                break;
+            }
+            ESP_LOGW(TAG,
+                     "Push medicion intento %u/%u fallo: %s",
+                     (unsigned)(i + 1),
+                     (unsigned)attempts,
+                     esp_err_to_name(err));
+        }
+
+        if (!sent) {
+            ESP_LOGW(TAG,
+                     "Medicion id=%lu no enviada tras %u intentos; queda recuperable por sincronizacion SD",
+                     (unsigned long)reading.measurement_id,
+                     (unsigned)attempts);
+        }
+    }
 }
 
 static void schedule_measurement_push(const captive_manager_readings_t *reading) {
-    if (!reading || !captive_manager_can_push_measurements()) {
+    if (!reading) {
+        return;
+    }
+    if (!s_measurement_push_queue) {
+        ESP_LOGW(TAG, "Push medicion: cola no inicializada");
+        return;
+    }
+    if (!captive_manager_can_push_measurements()) {
         return;
     }
 
-    measurement_push_ctx_t *ctx = calloc(1, sizeof(*ctx));
-    if (!ctx) {
-        ESP_LOGW(TAG, "Push medicion: sin memoria para crear tarea");
-        return;
-    }
-    ctx->reading = *reading;
-
-    BaseType_t ok = xTaskCreate(measurement_push_task,
-                                "measurement_push",
-                                MEASUREMENT_PUSH_TASK_STACK,
-                                ctx,
-                                tskIDLE_PRIORITY + 1,
-                                NULL);
-    if (ok != pdPASS) {
-        ESP_LOGW(TAG, "Push medicion: no se pudo crear tarea");
-        free(ctx);
+    if (xQueueSend(s_measurement_push_queue, reading, 0) != pdTRUE) {
+        ESP_LOGW(TAG,
+                 "Push medicion: cola llena; id=%lu queda recuperable por sincronizacion SD",
+                 (unsigned long)reading->measurement_id);
     }
 }
 
@@ -309,7 +308,9 @@ static void sensor_task(void *pv) {
         }
 
         esp_err_t sen_ret = sensors_read_sen55(&data);
+#if LOG_EACH_SAMPLE
         int sen_diag = sensors_get_last_sen55_diag();
+#endif
         bool voc_nox_ready_now = (xTaskGetTickCount() - sensor_start_tick) >= voc_nox_warmup_ticks;
         if (sen_ret == ESP_OK) {
             sum_pm1p0 += data.pm1p0;
@@ -473,6 +474,23 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &wifi_event_handler, NULL));
     captive_manager_set_sensors_started(false);
     ESP_ERROR_CHECK(captive_manager_start());
+
+    s_measurement_push_queue = xQueueCreate(MEASUREMENT_PUSH_QUEUE_LENGTH, sizeof(captive_manager_readings_t));
+    if (!s_measurement_push_queue) {
+        ESP_LOGE(TAG, "No se pudo crear cola de push de mediciones");
+    } else {
+        BaseType_t push_ok = xTaskCreate(measurement_push_task,
+                                         "measurement_push",
+                                         MEASUREMENT_PUSH_TASK_STACK,
+                                         NULL,
+                                         tskIDLE_PRIORITY + 1,
+                                         &s_push_task_handle);
+        if (push_ok != pdPASS) {
+            ESP_LOGE(TAG, "No se pudo iniciar tarea persistente de push");
+            vQueueDelete(s_measurement_push_queue);
+            s_measurement_push_queue = NULL;
+        }
+    }
 
     esp_err_t sd_ret = sd_store_init();
     if (sd_ret != ESP_OK) {

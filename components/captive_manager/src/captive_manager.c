@@ -521,13 +521,13 @@ static esp_err_t root_get(httpd_req_t *r)
         "input[type=submit]{background:#111;color:#fff}"
         "</style></head><body><div class=\"wrap\"><div class=\"card\">"
         "<h1>EcoSensor</h1>"
-        "<h1>Wi-Fi Manager</h1>"
+        "<p>Para conectar EcoSensor a su red local seleccione el SSID de la red wifi, si su red no aparece refresque la pagina web para volver a escanear</p>"
         "<form id=\"wifiForm\">"
-        "<label for=\"ssid\">SSID</label>"
+        "<label for=\"ssid\">SSID de la red local</label>"
         "<select id=\"ssid\" name=\"ssid\" required><option value=\"\" disabled selected>Cargando redes...</option></select>"
-        "<label for=\"pass\">Contraseña</label>"
-        "<input type=\"password\" id=\"pass\" name=\"pass\">"
-        "<div class=\"row-check\"><input type=\"checkbox\" id=\"use_static_ip\" name=\"use_static_ip\"><label for=\"use_static_ip\">Configurar IP manual</label><span style=\"font-size:12px;color:#555\">Si al conectar la red, el servidor no puede establecer conexion con el pruebe configurando una IP fija.</span></div>"
+        "<label for=\"pass\">Capture su Contraseña</label>"
+        "<input type=\"text\" id=\"pass\" name=\"pass\">"
+        "<div class=\"row-check\"><input type=\"checkbox\" id=\"use_static_ip\" name=\"use_static_ip\"><label for=\"use_static_ip\">Configurar IP manual</label></div>"
         "<div class=\"ip-grid\">"
         "<div><label for=\"static_ip\">IP</label><input type=\"text\" id=\"static_ip\" name=\"static_ip\" placeholder=\"192.168.1.201\" disabled></div>"
         "<div><label for=\"gateway\">Gateway</label><input type=\"text\" id=\"gateway\" name=\"gateway\" placeholder=\"192.168.1.254\" disabled></div>"
@@ -587,7 +587,26 @@ static esp_err_t root_get(httpd_req_t *r)
         "window.addEventListener('load',()=>{loadNetworks();applyStaticIpToggle();});"
         "</script></body></html>";
 
-    return httpd_resp_send(r, page, HTTPD_RESP_USE_STRLEN);
+    const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
+    char display_id[64];
+    if (strncmp(device_id, "ecosensor", 9) == 0 && strlen(device_id) > 9) {
+        snprintf(display_id, sizeof(display_id), "EcoSensor%s", device_id + 9);
+    } else {
+        snprintf(display_id, sizeof(display_id), "%s", device_id);
+    }
+
+    const char *marker = "<h1>EcoSensor</h1>";
+    const char *marker_pos = strstr(page, marker);
+    if (!marker_pos) {
+        return httpd_resp_send(r, page, HTTPD_RESP_USE_STRLEN);
+    }
+
+    httpd_resp_send_chunk(r, page, marker_pos - page);
+    char heading[96];
+    snprintf(heading, sizeof(heading), "<h1>%s</h1>", display_id);
+    httpd_resp_send_chunk(r, heading, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(r, marker_pos + strlen(marker), HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send_chunk(r, NULL, 0);
 }
 
 static esp_err_t save_post(httpd_req_t *r) {
