@@ -51,6 +51,12 @@ typedef struct {
     float scd_hum;
     float sen_temp;
     float sen_hum;
+    bool gps_valid;
+    double gps_lat;
+    double gps_lon;
+    uint8_t gps_satellites;
+    float gps_hdop;
+    uint32_t gps_age_ms;
 } captive_manager_readings_t;
 
 

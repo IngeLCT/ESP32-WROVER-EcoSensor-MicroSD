@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 
 #include "captive_manager.h"
+#include "gps.h"
 #include "sd_store.h"
 #include "sensors.h"
 
@@ -41,7 +42,7 @@ const float ECO_SEN55_TEMP_OFFSET_C = -3.02f;
 #define MEASUREMENT_PUSH_PORT          8765
 #define MEASUREMENT_PUSH_PATH          "/api/measurements/push"
 #define MEASUREMENT_PUSH_TIMEOUT_MS    3000
-#define MEASUREMENT_PUSH_TASK_STACK    6144
+#define MEASUREMENT_PUSH_TASK_STACK    7168
 #define MEASUREMENT_PUSH_QUEUE_LENGTH   6
 
 
@@ -67,7 +68,7 @@ static esp_err_t post_measurement_payload(const captive_manager_readings_t *read
         return ESP_ERR_INVALID_STATE;
     }
 
-    char payload[768];
+    char payload[1024];
     int len = snprintf(payload,
                        sizeof(payload),
                        "{\"device_id\":\"%s\",\"measurement_id\":%lu,"
@@ -77,7 +78,10 @@ static esp_err_t post_measurement_payload(const captive_manager_readings_t *read
                        "\"voc\":%.2f,\"nox\":%.2f,\"co2\":%u,"
                        "\"temp\":%.2f,\"hum\":%.2f,"
                        "\"scd_temp\":%.2f,\"scd_hum\":%.2f,"
-                       "\"sen_temp\":%.2f,\"sen_hum\":%.2f,\"window_s\":%lu}",
+                       "\"sen_temp\":%.2f,\"sen_hum\":%.2f,"
+                       "\"gps_valid\":%s,\"gps_lat\":%.6f,\"gps_lon\":%.6f,"
+                       "\"gps_satellites\":%u,\"gps_hdop\":%.2f,\"gps_age_ms\":%lu,"
+                       "\"window_s\":%lu}",
                        MDNS_HOSTNAME,
                        (unsigned long)reading->measurement_id,
                        (unsigned long)reading->boot_id,
@@ -98,6 +102,12 @@ static esp_err_t post_measurement_payload(const captive_manager_readings_t *read
                        reading->scd_hum,
                        reading->sen_temp,
                        reading->sen_hum,
+                       reading->gps_valid ? "true" : "false",
+                       reading->gps_valid ? reading->gps_lat : 0.0,
+                       reading->gps_valid ? reading->gps_lon : 0.0,
+                       reading->gps_satellites,
+                       reading->gps_hdop,
+                       (unsigned long)reading->gps_age_ms,
                        (unsigned long)reading->window_s);
     if (len <= 0 || len >= (int)sizeof(payload)) {
         ESP_LOGW(TAG, "Push medicion: payload demasiado grande");
@@ -238,6 +248,20 @@ static void publish_latest_average(const SensorData *avg) {
     snapshot.scd_hum = avg->scd_hum;
     snapshot.sen_temp = avg->sen_temp;
     snapshot.sen_hum = avg->sen_hum;
+
+    gps_fix_t gps_fix = {0};
+    esp_err_t gps_ret = gps_get_fix(&gps_fix, 10 * 60 * 1000, 90 * 1000);
+    if (gps_ret == ESP_OK && gps_fix.valid) {
+        snapshot.gps_valid = true;
+        snapshot.gps_lat = gps_fix.lat;
+        snapshot.gps_lon = gps_fix.lon;
+        snapshot.gps_satellites = gps_fix.satellites;
+        snapshot.gps_hdop = gps_fix.hdop;
+        snapshot.gps_age_ms = gps_fix.age_ms;
+    } else {
+        ESP_LOGE(TAG, "No se obtuvo fix GPS fresco para la medicion: %s", esp_err_to_name(gps_ret));
+        return;
+    }
 
     snapshot.time_valid = captive_manager_time_is_valid();
     if (snapshot.time_valid) {
@@ -420,8 +444,18 @@ static void sensor_start_task(void *pv) {
     while (1) {
         captive_state_t st = captive_manager_get_state();
         if (captive_manager_can_measure()) {
+            if (!gps_has_valid_fix()) {
+                ESP_LOGI(TAG,
+                         "%s; esperando primer fix GPS valido antes de iniciar sensores (time_valid=%s, push=%s)",
+                         captive_manager_can_push_measurements() ? "WiFi operativo" : "Modo offline AP+STA",
+                         captive_manager_time_is_valid() ? "true" : "false",
+                         captive_manager_can_push_measurements() ? "habilitado" : "deshabilitado");
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                continue;
+            }
+
             ESP_LOGI(TAG,
-                     "%s; iniciando sensores (time_valid=%s, push=%s)",
+                     "%s; GPS valido, iniciando sensores (time_valid=%s, push=%s)",
                      captive_manager_can_push_measurements() ? "WiFi operativo" : "Modo offline AP+STA",
                      captive_manager_time_is_valid() ? "true" : "false",
                      captive_manager_can_push_measurements() ? "habilitado" : "deshabilitado");
@@ -458,6 +492,10 @@ void app_main(void)
     }
 
     enable_board_peripherals_power();
+    esp_err_t gps_ret = gps_init();
+    if (gps_ret != ESP_OK) {
+        ESP_LOGE(TAG, "No se pudo inicializar GPS; sensores quedaran esperando fix: %s", esp_err_to_name(gps_ret));
+    }
 
     captive_manager_cfg_t cfg = {
         .ap_ssid = AP_SSID,

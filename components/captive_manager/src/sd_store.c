@@ -15,11 +15,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 static const char *TAG = "sd_store";
 static const char *MOUNT_POINT = "/sdcard";
 static const char *CSV_PATH = "/sdcard/data.csv";
-static const char *CSV_HEADER = "id,boot_id,uptime_s,time_valid,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,scd_temp,scd_hum,sen_temp,sen_hum,window_s\n";
+static const char *CSV_TMP_PATH = "/sdcard/data.tmp";
+static const char *CSV_HEADER = "id,boot_id,uptime_s,time_valid,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,scd_temp,scd_hum,sen_temp,sen_hum,gps_valid,gps_lat,gps_lon,gps_satellites,gps_hdop,gps_age_ms,window_s\n";
 #define STREAM_EXPORT_BATCH_ROWS 64
 
 static bool g_ready = false;
@@ -72,7 +74,58 @@ static bool file_exists(const char *path) {
 
 static void ensure_header(void) {
     if (file_exists(CSV_PATH)) {
-        ESP_LOGI(TAG, "CSV existente encontrado: %s", CSV_PATH);
+        FILE *existing = fopen(CSV_PATH, "r");
+        if (!existing) {
+            ESP_LOGW(TAG, "CSV existente no se pudo abrir para validar encabezado: %s errno=%d (%s)", CSV_PATH, errno, strerror(errno));
+            return;
+        }
+
+        char first_line[512] = {0};
+        bool has_header = fgets(first_line, sizeof(first_line), existing) != NULL;
+        bool header_has_gps = has_header && strstr(first_line, "gps_lat") != NULL && strstr(first_line, "gps_lon") != NULL;
+        if (header_has_gps) {
+            fclose(existing);
+            ESP_LOGI(TAG, "CSV existente con encabezado GPS encontrado: %s", CSV_PATH);
+            return;
+        }
+
+        ESP_LOGW(TAG, "CSV existente sin encabezado GPS; migrando encabezado sin borrar mediciones");
+        FILE *tmp = fopen(CSV_TMP_PATH, "w");
+        if (!tmp) {
+            fclose(existing);
+            ESP_LOGE(TAG, "No se pudo crear CSV temporal para migrar encabezado: %s errno=%d (%s)", CSV_TMP_PATH, errno, strerror(errno));
+            return;
+        }
+        if (fputs(CSV_HEADER, tmp) == EOF) {
+            ESP_LOGE(TAG, "No se pudo escribir encabezado GPS temporal: errno=%d (%s)", errno, strerror(errno));
+            fclose(existing);
+            fclose(tmp);
+            unlink(CSV_TMP_PATH);
+            return;
+        }
+
+        char line[512];
+        while (fgets(line, sizeof(line), existing)) {
+            if (fputs(line, tmp) == EOF) {
+                ESP_LOGE(TAG, "Error copiando fila existente durante migracion CSV: errno=%d (%s)", errno, strerror(errno));
+                fclose(existing);
+                fclose(tmp);
+                unlink(CSV_TMP_PATH);
+                return;
+            }
+        }
+        fclose(existing);
+        if (fclose(tmp) != 0) {
+            ESP_LOGE(TAG, "Error cerrando CSV temporal: errno=%d (%s)", errno, strerror(errno));
+            unlink(CSV_TMP_PATH);
+            return;
+        }
+        if (rename(CSV_TMP_PATH, CSV_PATH) != 0) {
+            ESP_LOGE(TAG, "No se pudo reemplazar CSV tras migrar encabezado: errno=%d (%s)", errno, strerror(errno));
+            unlink(CSV_TMP_PATH);
+            return;
+        }
+        ESP_LOGI(TAG, "Encabezado CSV migrado a formato GPS correctamente");
         return;
     }
     ESP_LOGI(TAG, "CSV no existe; creando archivo nuevo: %s", CSV_PATH);
@@ -99,7 +152,7 @@ static uint32_t scan_last_id(void) {
         return 0;
     }
 
-    char line[320];
+    char line[512];
     uint32_t last = 0;
     uint32_t rows = 0;
     while (1) {
@@ -246,7 +299,7 @@ esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uin
     if (g_lock) xSemaphoreTake(g_lock, portMAX_DELAY);
     uint32_t id = ++g_last_id;
     ESP_LOGI(TAG,
-             "Guardando medicion SD id=%lu boot_id=%lu uptime_s=%lu time_valid=%s timestamp=%s co2=%u pm2.5=%.2f voc=%.2f nox=%.2f temp=%.2f hum=%.2f scd=%.2f/%.2f sen=%.2f/%.2f window_s=%lu",
+             "Guardando medicion SD id=%lu boot_id=%lu uptime_s=%lu time_valid=%s timestamp=%s co2=%u pm2.5=%.2f voc=%.2f nox=%.2f temp=%.2f hum=%.2f scd=%.2f/%.2f sen=%.2f/%.2f gps=%s %.6f/%.6f window_s=%lu",
              (unsigned long)id,
              (unsigned long)reading->boot_id,
              (unsigned long)reading->uptime_s,
@@ -262,6 +315,9 @@ esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uin
              reading->scd_hum,
              reading->sen_temp,
              reading->sen_hum,
+             reading->gps_valid ? "true" : "false",
+             reading->gps_valid ? reading->gps_lat : 0.0,
+             reading->gps_valid ? reading->gps_lon : 0.0,
              (unsigned long)reading->window_s);
 
     FILE *f = fopen(CSV_PATH, "a");
@@ -274,7 +330,7 @@ esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uin
 
     long row_offset = ftell(f);
     int written = fprintf(f,
-                          "%lu,%lu,%lu,%u,%s,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%lu\n",
+                          "%lu,%lu,%lu,%u,%s,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%.6f,%.6f,%u,%.2f,%lu,%lu\n",
                           (unsigned long)id,
                           (unsigned long)reading->boot_id,
                           (unsigned long)reading->uptime_s,
@@ -293,6 +349,12 @@ esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uin
                           reading->scd_hum,
                           reading->sen_temp,
                           reading->sen_hum,
+                          reading->gps_valid ? 1U : 0U,
+                          reading->gps_valid ? reading->gps_lat : 0.0,
+                          reading->gps_valid ? reading->gps_lon : 0.0,
+                          reading->gps_satellites,
+                          reading->gps_hdop,
+                          (unsigned long)reading->gps_age_ms,
                           (unsigned long)reading->window_s);
     if (written < 0) {
         ESP_LOGE(TAG, "fprintf fallo al escribir medicion id=%lu: errno=%d (%s)", (unsigned long)id, errno, strerror(errno));
@@ -347,6 +409,12 @@ typedef struct {
     float scd_hum;
     float sen_temp;
     float sen_hum;
+    bool gps_valid;
+    double gps_lat;
+    double gps_lon;
+    uint32_t gps_satellites;
+    float gps_hdop;
+    uint32_t gps_age_ms;
     uint32_t window_s;
 } sd_store_row_t;
 
@@ -401,14 +469,47 @@ static bool parse_csv_line(const char *line, sd_store_row_t *row) {
         return false;
     }
 
-    char copy[320];
+    char copy[512];
     snprintf(copy, sizeof(copy), "%s", line);
 
-    char *fields[20] = {0};
-    int n = split_csv_simple(copy, fields, 20);
+    char *fields[28] = {0};
+    int n = split_csv_simple(copy, fields, 28);
     memset(row, 0, sizeof(*row));
 
-    // Formato nuevo extendido:
+    // Formato nuevo con GPS:
+    // id,boot_id,uptime_s,time_valid,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,scd_temp,scd_hum,sen_temp,sen_hum,gps_valid,gps_lat,gps_lon,gps_satellites,gps_hdop,gps_age_ms,window_s
+    if (n >= 25 && parse_u32_field(fields[0], &row->id) && parse_u32_field(fields[1], &row->boot_id)) {
+        uint32_t time_valid = 0;
+        uint32_t gps_valid = 0;
+        bool ok = parse_u32_field(fields[2], &row->uptime_s) &&
+               parse_u32_field(fields[3], &time_valid) &&
+               (row->time_valid = time_valid != 0, true) &&
+               (snprintf(row->timestamp, sizeof(row->timestamp), "%s", fields[4] ? fields[4] : ""), true) &&
+               parse_u32_field(fields[5], &row->co2) &&
+               parse_float_field(fields[6], &row->pm1p0) &&
+               parse_float_field(fields[7], &row->pm2p5) &&
+               parse_float_field(fields[8], &row->pm4p0) &&
+               parse_float_field(fields[9], &row->pm10p0) &&
+               parse_float_field(fields[10], &row->voc) &&
+               parse_float_field(fields[11], &row->nox) &&
+               parse_float_field(fields[12], &row->temp) &&
+               parse_float_field(fields[13], &row->hum) &&
+               parse_float_field(fields[14], &row->scd_temp) &&
+               parse_float_field(fields[15], &row->scd_hum) &&
+               parse_float_field(fields[16], &row->sen_temp) &&
+               parse_float_field(fields[17], &row->sen_hum) &&
+               parse_u32_field(fields[18], &gps_valid) &&
+               (row->gps_lat = strtod(fields[19] ? fields[19] : "0", NULL), true) &&
+               (row->gps_lon = strtod(fields[20] ? fields[20] : "0", NULL), true) &&
+               parse_u32_field(fields[21], &row->gps_satellites) &&
+               parse_float_field(fields[22], &row->gps_hdop) &&
+               parse_u32_field(fields[23], &row->gps_age_ms) &&
+               parse_u32_field(fields[24], &row->window_s);
+        row->gps_valid = gps_valid != 0;
+        return ok;
+    }
+
+    // Formato nuevo extendido sin GPS:
     // id,boot_id,uptime_s,time_valid,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,scd_temp,scd_hum,sen_temp,sen_hum,window_s
     if (n >= 19 && parse_u32_field(fields[0], &row->id) && parse_u32_field(fields[1], &row->boot_id)) {
         uint32_t time_valid = 0;
@@ -511,6 +612,20 @@ static void add_row_fields(cJSON *row, const sd_store_row_t *parsed) {
     cJSON_AddNumberToObject(row, "scd_hum", parsed->scd_hum);
     cJSON_AddNumberToObject(row, "sen_temp", parsed->sen_temp);
     cJSON_AddNumberToObject(row, "sen_hum", parsed->sen_hum);
+    cJSON_AddBoolToObject(row, "gps_valid", parsed->gps_valid);
+    if (parsed->gps_valid) {
+        cJSON_AddNumberToObject(row, "gps_lat", parsed->gps_lat);
+        cJSON_AddNumberToObject(row, "gps_lon", parsed->gps_lon);
+        cJSON_AddNumberToObject(row, "gps_satellites", parsed->gps_satellites);
+        cJSON_AddNumberToObject(row, "gps_hdop", parsed->gps_hdop);
+        cJSON_AddNumberToObject(row, "gps_age_ms", parsed->gps_age_ms);
+    } else {
+        cJSON_AddNullToObject(row, "gps_lat");
+        cJSON_AddNullToObject(row, "gps_lon");
+        cJSON_AddNumberToObject(row, "gps_satellites", 0);
+        cJSON_AddNumberToObject(row, "gps_hdop", 0);
+        cJSON_AddNumberToObject(row, "gps_age_ms", 0);
+    }
     cJSON_AddNumberToObject(row, "window_s", parsed->window_s);
 }
 
@@ -532,7 +647,7 @@ static esp_err_t write_row_ndjson(const sd_store_row_t *parsed, sd_store_ndjson_
         snprintf(timestamp_field, sizeof(timestamp_field), "null");
     }
 
-    char line[640];
+    char line[768];
     int len = snprintf(
         line,
         sizeof(line),
@@ -540,7 +655,9 @@ static esp_err_t write_row_ndjson(const sd_store_row_t *parsed, sd_store_ndjson_
         "\"time_valid\":%s,\"time_source\":\"%s\",\"timestamp\":%s,"
         "\"co2\":%lu,\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
         "\"voc\":%.2f,\"nox\":%.2f,\"temp\":%.2f,\"hum\":%.2f,"
-        "\"scd_temp\":%.2f,\"scd_hum\":%.2f,\"sen_temp\":%.2f,\"sen_hum\":%.2f,\"window_s\":%lu}\n",
+        "\"scd_temp\":%.2f,\"scd_hum\":%.2f,\"sen_temp\":%.2f,\"sen_hum\":%.2f,"
+        "\"gps_valid\":%s,\"gps_lat\":%.6f,\"gps_lon\":%.6f,"
+        "\"gps_satellites\":%lu,\"gps_hdop\":%.2f,\"gps_age_ms\":%lu,\"window_s\":%lu}\n",
         (unsigned long)parsed->id,
         (unsigned long)parsed->id,
         (unsigned long)parsed->boot_id,
@@ -561,6 +678,12 @@ static esp_err_t write_row_ndjson(const sd_store_row_t *parsed, sd_store_ndjson_
         parsed->scd_hum,
         parsed->sen_temp,
         parsed->sen_hum,
+        parsed->gps_valid ? "true" : "false",
+        parsed->gps_valid ? parsed->gps_lat : 0.0,
+        parsed->gps_valid ? parsed->gps_lon : 0.0,
+        (unsigned long)parsed->gps_satellites,
+        parsed->gps_hdop,
+        (unsigned long)parsed->gps_age_ms,
         (unsigned long)parsed->window_s
     );
     if (len <= 0 || len >= (int)sizeof(line)) {
@@ -624,7 +747,7 @@ esp_err_t sd_store_add_latest_reading(cJSON *object, uint32_t timeout_ms, bool *
         rewind(f);
     }
 
-    char line[320];
+    char line[512];
     sd_store_row_t latest = {0};
     bool have_latest = false;
     int64_t started_us = esp_timer_get_time();
@@ -675,7 +798,7 @@ esp_err_t sd_store_add_readings_since(cJSON *array, uint32_t after_id, uint32_t 
         return ESP_FAIL;
     }
 
-    char line[320];
+    char line[512];
     uint32_t count = 0;
     uint32_t scanned_rows = 0;
     esp_err_t result = ESP_OK;
@@ -736,7 +859,7 @@ esp_err_t sd_store_add_readings_range(cJSON *array, uint32_t from_id, uint32_t t
         rewind(f);
     }
 
-    char line[320];
+    char line[512];
     uint32_t count = 0;
     uint32_t scanned_rows = 0;
     esp_err_t result = ESP_OK;
@@ -830,7 +953,7 @@ esp_err_t sd_store_stream_readings_range_ndjson(uint32_t from_id, uint32_t to_id
             rewind(f);
         }
 
-        char line[320];
+        char line[512];
         while (batch_count < STREAM_EXPORT_BATCH_ROWS && fgets(line, sizeof(line), f)) {
             if ((scanned_rows & 0x0F) == 0 && scan_timed_out(started_us, timeout_ms)) {
                 result = ESP_ERR_TIMEOUT;
@@ -904,7 +1027,7 @@ esp_err_t sd_store_add_recent_readings(cJSON *array, uint32_t after_id, uint32_t
         return ESP_FAIL;
     }
 
-    char line[320];
+    char line[512];
     uint32_t matched = 0;
     uint32_t scanned_rows = 0;
     esp_err_t result = ESP_OK;

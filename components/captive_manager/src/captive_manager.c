@@ -777,6 +777,14 @@ static esp_err_t status_get(httpd_req_t *r) {
         cJSON_AddNullToObject(root, "last_measurement_timestamp");
     }
     cJSON_AddBoolToObject(root, "last_measurement_time_valid", g_last_readings.time_valid);
+    cJSON_AddBoolToObject(root, "gps_valid", g_last_readings.gps_valid);
+    if (g_last_readings.gps_valid) {
+        cJSON_AddNumberToObject(root, "gps_lat", g_last_readings.gps_lat);
+        cJSON_AddNumberToObject(root, "gps_lon", g_last_readings.gps_lon);
+        cJSON_AddNumberToObject(root, "gps_satellites", g_last_readings.gps_satellites);
+        cJSON_AddNumberToObject(root, "gps_hdop", g_last_readings.gps_hdop);
+        cJSON_AddNumberToObject(root, "gps_age_ms", g_last_readings.gps_age_ms);
+    }
     cJSON_AddStringToObject(root, "state", captive_manager_state_str(g_state));
     cJSON_AddBoolToObject(root, "using_saved", g_using_saved);
     cJSON_AddBoolToObject(root, "saved_apsta_mode", g_saved_apsta_mode);
@@ -849,6 +857,20 @@ static esp_err_t lecturas_get(httpd_req_t *r) {
             cJSON_AddNumberToObject(root, "scd_hum", g_last_readings.scd_hum);
             cJSON_AddNumberToObject(root, "sen_temp", g_last_readings.sen_temp);
             cJSON_AddNumberToObject(root, "sen_hum", g_last_readings.sen_hum);
+            cJSON_AddBoolToObject(root, "gps_valid", g_last_readings.gps_valid);
+            if (g_last_readings.gps_valid) {
+                cJSON_AddNumberToObject(root, "gps_lat", g_last_readings.gps_lat);
+                cJSON_AddNumberToObject(root, "gps_lon", g_last_readings.gps_lon);
+                cJSON_AddNumberToObject(root, "gps_satellites", g_last_readings.gps_satellites);
+                cJSON_AddNumberToObject(root, "gps_hdop", g_last_readings.gps_hdop);
+                cJSON_AddNumberToObject(root, "gps_age_ms", g_last_readings.gps_age_ms);
+            } else {
+                cJSON_AddNullToObject(root, "gps_lat");
+                cJSON_AddNullToObject(root, "gps_lon");
+                cJSON_AddNumberToObject(root, "gps_satellites", 0);
+                cJSON_AddNumberToObject(root, "gps_hdop", 0);
+                cJSON_AddNumberToObject(root, "gps_age_ms", 0);
+            }
         }
     }
 
