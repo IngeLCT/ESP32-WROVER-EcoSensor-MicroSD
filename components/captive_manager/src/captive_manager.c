@@ -784,6 +784,12 @@ static esp_err_t status_get(httpd_req_t *r) {
         cJSON_AddNumberToObject(root, "gps_satellites", g_last_readings.gps_satellites);
         cJSON_AddNumberToObject(root, "gps_hdop", g_last_readings.gps_hdop);
         cJSON_AddNumberToObject(root, "gps_age_ms", g_last_readings.gps_age_ms);
+    } else {
+        cJSON_AddNullToObject(root, "gps_lat");
+        cJSON_AddNullToObject(root, "gps_lon");
+        cJSON_AddNumberToObject(root, "gps_satellites", 0);
+        cJSON_AddNumberToObject(root, "gps_hdop", 0);
+        cJSON_AddNumberToObject(root, "gps_age_ms", 0);
     }
     cJSON_AddStringToObject(root, "state", captive_manager_state_str(g_state));
     cJSON_AddBoolToObject(root, "using_saved", g_using_saved);

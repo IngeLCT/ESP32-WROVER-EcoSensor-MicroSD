@@ -647,6 +647,16 @@ static esp_err_t write_row_ndjson(const sd_store_row_t *parsed, sd_store_ndjson_
         snprintf(timestamp_field, sizeof(timestamp_field), "null");
     }
 
+    char gps_lat_field[32];
+    char gps_lon_field[32];
+    if (parsed->gps_valid) {
+        snprintf(gps_lat_field, sizeof(gps_lat_field), "%.6f", parsed->gps_lat);
+        snprintf(gps_lon_field, sizeof(gps_lon_field), "%.6f", parsed->gps_lon);
+    } else {
+        snprintf(gps_lat_field, sizeof(gps_lat_field), "null");
+        snprintf(gps_lon_field, sizeof(gps_lon_field), "null");
+    }
+
     char line[768];
     int len = snprintf(
         line,
@@ -656,7 +666,7 @@ static esp_err_t write_row_ndjson(const sd_store_row_t *parsed, sd_store_ndjson_
         "\"co2\":%lu,\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
         "\"voc\":%.2f,\"nox\":%.2f,\"temp\":%.2f,\"hum\":%.2f,"
         "\"scd_temp\":%.2f,\"scd_hum\":%.2f,\"sen_temp\":%.2f,\"sen_hum\":%.2f,"
-        "\"gps_valid\":%s,\"gps_lat\":%.6f,\"gps_lon\":%.6f,"
+        "\"gps_valid\":%s,\"gps_lat\":%s,\"gps_lon\":%s,"
         "\"gps_satellites\":%lu,\"gps_hdop\":%.2f,\"gps_age_ms\":%lu,\"window_s\":%lu}\n",
         (unsigned long)parsed->id,
         (unsigned long)parsed->id,
@@ -679,8 +689,8 @@ static esp_err_t write_row_ndjson(const sd_store_row_t *parsed, sd_store_ndjson_
         parsed->sen_temp,
         parsed->sen_hum,
         parsed->gps_valid ? "true" : "false",
-        parsed->gps_valid ? parsed->gps_lat : 0.0,
-        parsed->gps_valid ? parsed->gps_lon : 0.0,
+        gps_lat_field,
+        gps_lon_field,
         (unsigned long)parsed->gps_satellites,
         parsed->gps_hdop,
         (unsigned long)parsed->gps_age_ms,
