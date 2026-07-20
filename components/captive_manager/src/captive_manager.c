@@ -826,6 +826,12 @@ static esp_err_t status_get(httpd_req_t *r) {
     cJSON_AddStringToObject(root, "mdns", mdns_name);
     cJSON_AddBoolToObject(root, "sd_ready", sd_store_is_ready());
     cJSON_AddNumberToObject(root, "sd_last_id", sd_store_last_id());
+    cJSON_AddBoolToObject(root, "checkpoint_valid", sd_store_checkpoint_valid());
+    cJSON_AddNumberToObject(root, "checkpoint_generation", (double)sd_store_checkpoint_generation());
+    cJSON_AddBoolToObject(root, "history_index_ready", sd_store_history_index_ready());
+    cJSON_AddBoolToObject(root, "history_index_rebuilding", sd_store_history_index_rebuilding());
+    cJSON_AddNumberToObject(root, "history_index_points", sd_store_history_index_points());
+    cJSON_AddNumberToObject(root, "sd_format_version", sd_store_format_version());
     cJSON_AddNumberToObject(root, "boot_id", g_boot_id);
     cJSON_AddNumberToObject(root, "current_uptime_s", (double)(esp_timer_get_time() / 1000000ULL));
     cJSON_AddBoolToObject(root, "time_valid", g_time_valid);
