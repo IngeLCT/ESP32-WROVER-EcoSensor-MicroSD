@@ -21,6 +21,7 @@ static const char *TAG = "sd_store";
 static const char *MOUNT_POINT = "/sdcard";
 static const char *CSV_PATH = "/sdcard/data.csv";
 static const char *CSV_TMP_PATH = "/sdcard/data.tmp";
+static const char *CSV_BAK_PATH = "/sdcard/data.bak";
 static const char *CSV_HEADER = "id,boot_id,uptime_s,time_valid,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,scd_temp,scd_hum,sen_temp,sen_hum,gps_valid,gps_lat,gps_lon,gps_satellites,gps_hdop,gps_age_ms,window_s\n";
 #define STREAM_EXPORT_BATCH_ROWS 64
 
@@ -73,6 +74,31 @@ static bool file_exists(const char *path) {
 }
 
 static void ensure_header(void) {
+    /* Recupera el CSV original si un reinicio interrumpio una migracion justo
+       despues de mover data.csv a data.bak. */
+    if (!file_exists(CSV_PATH) && file_exists(CSV_BAK_PATH)) {
+        if (rename(CSV_BAK_PATH, CSV_PATH) == 0) {
+            ESP_LOGW(TAG, "CSV original restaurado desde respaldo de migracion");
+        } else {
+            ESP_LOGE(TAG, "No se pudo restaurar respaldo CSV: errno=%d (%s)", errno, strerror(errno));
+            return;
+        }
+    }
+
+    /* Si solo sobrevivio el temporal, se conserva como CSV activo. Si ya hay
+       un CSV (original o restaurado), el temporal incompleto se descarta. */
+    if (!file_exists(CSV_PATH) && !file_exists(CSV_BAK_PATH) && file_exists(CSV_TMP_PATH)) {
+        if (rename(CSV_TMP_PATH, CSV_PATH) == 0) {
+            ESP_LOGW(TAG, "CSV migrado recuperado desde archivo temporal");
+        } else {
+            ESP_LOGE(TAG, "No se pudo recuperar CSV temporal: errno=%d (%s)", errno, strerror(errno));
+            return;
+        }
+    }
+    if (file_exists(CSV_PATH)) {
+        unlink(CSV_TMP_PATH);
+    }
+
     if (file_exists(CSV_PATH)) {
         FILE *existing = fopen(CSV_PATH, "r");
         if (!existing) {
@@ -82,9 +108,13 @@ static void ensure_header(void) {
 
         char first_line[512] = {0};
         bool has_header = fgets(first_line, sizeof(first_line), existing) != NULL;
+        bool first_line_is_header = has_header && strncmp(first_line, "id,", 3) == 0;
         bool header_has_gps = has_header && strstr(first_line, "gps_lat") != NULL && strstr(first_line, "gps_lon") != NULL;
         if (header_has_gps) {
             fclose(existing);
+            if (unlink(CSV_BAK_PATH) != 0 && errno != ENOENT) {
+                ESP_LOGW(TAG, "CSV valido, pero no se pudo borrar respaldo antiguo: errno=%d (%s)", errno, strerror(errno));
+            }
             ESP_LOGI(TAG, "CSV existente con encabezado GPS encontrado: %s", CSV_PATH);
             return;
         }
@@ -98,6 +128,13 @@ static void ensure_header(void) {
         }
         if (fputs(CSV_HEADER, tmp) == EOF) {
             ESP_LOGE(TAG, "No se pudo escribir encabezado GPS temporal: errno=%d (%s)", errno, strerror(errno));
+            fclose(existing);
+            fclose(tmp);
+            unlink(CSV_TMP_PATH);
+            return;
+        }
+        if (has_header && !first_line_is_header && fputs(first_line, tmp) == EOF) {
+            ESP_LOGE(TAG, "No se pudo conservar primera fila durante migracion CSV: errno=%d (%s)", errno, strerror(errno));
             fclose(existing);
             fclose(tmp);
             unlink(CSV_TMP_PATH);
@@ -120,10 +157,33 @@ static void ensure_header(void) {
             unlink(CSV_TMP_PATH);
             return;
         }
-        if (rename(CSV_TMP_PATH, CSV_PATH) != 0) {
-            ESP_LOGE(TAG, "No se pudo reemplazar CSV tras migrar encabezado: errno=%d (%s)", errno, strerror(errno));
+        if (file_exists(CSV_BAK_PATH) && unlink(CSV_BAK_PATH) != 0) {
+            ESP_LOGE(TAG, "No se pudo limpiar respaldo CSV anterior: errno=%d (%s)", errno, strerror(errno));
             unlink(CSV_TMP_PATH);
             return;
+        }
+        if (rename(CSV_PATH, CSV_BAK_PATH) != 0) {
+            ESP_LOGE(TAG, "No se pudo respaldar CSV antes de migrar encabezado: errno=%d (%s)", errno, strerror(errno));
+            unlink(CSV_TMP_PATH);
+            return;
+        }
+        if (rename(CSV_TMP_PATH, CSV_PATH) != 0) {
+            int replace_errno = errno;
+            ESP_LOGE(TAG, "No se pudo instalar CSV migrado: errno=%d (%s)", replace_errno, strerror(replace_errno));
+            if (rename(CSV_BAK_PATH, CSV_PATH) == 0) {
+                ESP_LOGW(TAG, "CSV original restaurado despues del fallo de migracion");
+                unlink(CSV_TMP_PATH);
+            } else {
+                ESP_LOGE(TAG,
+                         "No se pudo restaurar CSV original; se conserva en %s: errno=%d (%s)",
+                         CSV_BAK_PATH,
+                         errno,
+                         strerror(errno));
+            }
+            return;
+        }
+        if (unlink(CSV_BAK_PATH) != 0 && errno != ENOENT) {
+            ESP_LOGW(TAG, "CSV migrado, pero no se pudo borrar respaldo: errno=%d (%s)", errno, strerror(errno));
         }
         ESP_LOGI(TAG, "Encabezado CSV migrado a formato GPS correctamente");
         return;

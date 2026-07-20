@@ -38,7 +38,7 @@ const float ECO_SEN55_TEMP_OFFSET_C = -3.02f;
 #define SEN51_VOC_NOX_WARMUP_MS  120000
 #define BOARD_POWERON_PIN        GPIO_NUM_12
 
-#define MEASUREMENT_PUSH_ENDPOINT      "http://ecosensor-servidor.local:8765/api/measurements/push"
+#define MEASUREMENT_PUSH_ENDPOINT      "http://ecosensor.local:8765/api/measurements/push"
 #define MEASUREMENT_PUSH_PORT          8765
 #define MEASUREMENT_PUSH_PATH          "/api/measurements/push"
 #define MEASUREMENT_PUSH_TIMEOUT_MS    3000
