@@ -11,6 +11,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define GPS_UART_PORT          UART_NUM_2
 #define GPS_TX_PIN             GPIO_NUM_21
@@ -28,9 +29,22 @@ static SemaphoreHandle_t s_gps_lock = NULL;
 static gps_fix_t s_last_fix = {0};
 static TickType_t s_last_fix_tick = 0;
 static bool s_started = false;
+static gps_time_callback_t s_time_callback = NULL;
+static time_t s_last_reported_epoch = 0;
 
 static bool starts_with(const char *text, const char *prefix) {
     return text && prefix && strncmp(text, prefix, strlen(prefix)) == 0;
+}
+
+static time_t utc_fields_to_epoch(int year, int month, int day, int hour, int minute, int second) {
+    int adjusted_year = year - (month <= 2 ? 1 : 0);
+    int era = (adjusted_year >= 0 ? adjusted_year : adjusted_year - 399) / 400;
+    unsigned year_of_era = (unsigned)(adjusted_year - era * 400);
+    unsigned month_prime = (unsigned)(month + (month > 2 ? -3 : 9));
+    unsigned day_of_year = (153U * month_prime + 2U) / 5U + (unsigned)day - 1U;
+    unsigned day_of_era = year_of_era * 365U + year_of_era / 4U - year_of_era / 100U + day_of_year;
+    int64_t days = (int64_t)era * 146097LL + (int64_t)day_of_era - 719468LL;
+    return (time_t)(days * 86400LL + hour * 3600LL + minute * 60LL + second);
 }
 
 static bool checksum_ok(const char *line) {
@@ -118,14 +132,63 @@ static void store_fix(double lat, double lon, uint8_t satellites, float hdop) {
 
 static void parse_rmc(char **fields, int n) {
     // RMC: type,time,status,lat,N,lon,E,speed,course,date,...
-    if (n < 7 || !fields[2] || fields[2][0] != 'A') {
+    if (n < 10 || !fields[2] || fields[2][0] != 'A') {
         return;
+    }
+
+    /* RMC entrega hora y fecha UTC: hhmmss.sss y ddmmyy. Solo se usa una
+       sentencia activa (A) y con todos los campos calendarios validos. */
+    const char *utc_time = fields[1];
+    const char *utc_date = fields[9];
+    if (utc_time && utc_date && strlen(utc_time) >= 6 && strlen(utc_date) == 6) {
+        bool digits_ok = true;
+        for (int i = 0; i < 6; ++i) {
+            if (utc_time[i] < '0' || utc_time[i] > '9' || utc_date[i] < '0' || utc_date[i] > '9') {
+                digits_ok = false;
+                break;
+            }
+        }
+        if (digits_ok) {
+            int hour = (utc_time[0] - '0') * 10 + (utc_time[1] - '0');
+            int minute = (utc_time[2] - '0') * 10 + (utc_time[3] - '0');
+            int second = (utc_time[4] - '0') * 10 + (utc_time[5] - '0');
+            int day = (utc_date[0] - '0') * 10 + (utc_date[1] - '0');
+            int month = (utc_date[2] - '0') * 10 + (utc_date[3] - '0');
+            int year2 = (utc_date[4] - '0') * 10 + (utc_date[5] - '0');
+            int year = year2 >= 80 ? 1900 + year2 : 2000 + year2;
+            struct tm tm_utc = {
+                .tm_sec = second,
+                .tm_min = minute,
+                .tm_hour = hour,
+                .tm_mday = day,
+                .tm_mon = month - 1,
+                .tm_year = year - 1900,
+                .tm_isdst = 0,
+            };
+            if (year >= 2024 && month >= 1 && month <= 12 && day >= 1 && day <= 31 &&
+                hour <= 23 && minute <= 59 && second <= 59) {
+                time_t epoch = utc_fields_to_epoch(year, month, day, hour, minute, second);
+                struct tm check = {0};
+                gmtime_r(&epoch, &check);
+                bool roundtrip_ok = check.tm_year == tm_utc.tm_year && check.tm_mon == tm_utc.tm_mon &&
+                                    check.tm_mday == tm_utc.tm_mday && check.tm_hour == tm_utc.tm_hour &&
+                                    check.tm_min == tm_utc.tm_min && check.tm_sec == tm_utc.tm_sec;
+                if (roundtrip_ok && epoch > 0 && s_time_callback && epoch != s_last_reported_epoch) {
+                    s_last_reported_epoch = epoch;
+                    s_time_callback(epoch);
+                }
+            }
+        }
     }
     double lat = 0.0;
     double lon = 0.0;
     if (parse_coordinate(fields[3], fields[4], &lat) && parse_coordinate(fields[5], fields[6], &lon)) {
         store_fix(lat, lon, 0, 0.0f);
     }
+}
+
+void gps_set_time_callback(gps_time_callback_t callback) {
+    s_time_callback = callback;
 }
 
 static void parse_gga(char **fields, int n) {

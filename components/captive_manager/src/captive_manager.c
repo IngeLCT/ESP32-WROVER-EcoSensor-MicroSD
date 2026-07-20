@@ -16,6 +16,7 @@
 #include "freertos/task.h"
 #include "mdns.h"
 #include "lwip/ip4_addr.h"
+#include "esp_sntp.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -48,6 +49,10 @@ static char g_push_host[64] = {0};
 static int  g_connect_attempts = 0;
 static int64_t g_boot_time_ms = 0;
 static captive_manager_readings_t g_last_readings = {0};
+static bool g_sntp_started = false;
+
+#define MIN_VALID_EPOCH 1704067200LL /* 2024-01-01T00:00:00Z */
+#define TIME_ADJUST_THRESHOLD_SECONDS 10
 
 static void restart_later_task(void *arg) {
     vTaskDelay(pdMS_TO_TICKS(800));
@@ -72,6 +77,19 @@ static esp_err_t apply_device_time(const char *date, const char *time_text);
 static void load_saved_device_time(void);
 static void get_active_ip_string(char *buf, size_t buf_size);
 static void get_current_datetime_string(char *buf, size_t buf_size);
+static void start_sntp_if_needed(void);
+static bool parse_utc_timestamp(const char *timestamp, time_t *epoch_out);
+
+static time_t utc_fields_to_epoch(int year, int month, int day, int hour, int minute, int second) {
+    int adjusted_year = year - (month <= 2 ? 1 : 0);
+    int era = (adjusted_year >= 0 ? adjusted_year : adjusted_year - 399) / 400;
+    unsigned year_of_era = (unsigned)(adjusted_year - era * 400);
+    unsigned month_prime = (unsigned)(month + (month > 2 ? -3 : 9));
+    unsigned day_of_year = (153U * month_prime + 2U) / 5U + (unsigned)day - 1U;
+    unsigned day_of_era = year_of_era * 365U + year_of_era / 4U - year_of_era / 100U + day_of_year;
+    int64_t days = (int64_t)era * 146097LL + (int64_t)day_of_era - 719468LL;
+    return (time_t)(days * 86400LL + hour * 3600LL + minute * 60LL + second);
+}
 
 const char* captive_manager_state_str(captive_state_t st) {
     switch(st){
@@ -118,6 +136,73 @@ void captive_manager_set_last_readings(const captive_manager_readings_t *reading
 
 bool captive_manager_time_is_valid(void) {
     return g_time_valid;
+}
+
+const char *captive_manager_time_source(void) {
+    return g_time_valid ? g_last_sync_source : "none";
+}
+
+time_t captive_manager_current_epoch(void) {
+    return g_time_valid ? time(NULL) : 0;
+}
+
+static int time_source_priority(const char *source) {
+    if (!source) return 0;
+    if (strcmp(source, "gps") == 0) return 3;
+    if (strcmp(source, "ntp") == 0) return 2;
+    if (strcmp(source, "server") == 0) return 1;
+    return 0;
+}
+
+esp_err_t captive_manager_offer_time_epoch(time_t epoch_utc, const char *source) {
+    if (epoch_utc < (time_t)MIN_VALID_EPOCH || time_source_priority(source) == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int incoming_priority = time_source_priority(source);
+    int current_priority = time_source_priority(g_last_sync_source);
+    time_t current = time(NULL);
+    long long drift = g_time_valid ? llabs((long long)epoch_utc - (long long)current) : 0;
+
+    /* El servidor es solo respaldo: nunca reemplaza GPS/NTP validos. Una
+       fuente de igual o mayor calidad solo ajusta si el desfase es material. */
+    if (g_time_valid && incoming_priority < current_priority) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!g_time_valid || drift > TIME_ADJUST_THRESHOLD_SECONDS) {
+        struct timeval tv = {.tv_sec = epoch_utc, .tv_usec = 0};
+        if (settimeofday(&tv, NULL) != 0) {
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "Reloj UTC ajustado por %s; epoch=%lld desfase=%lld s",
+                 source, (long long)epoch_utc, drift);
+    }
+
+    g_time_valid = true;
+    snprintf(g_last_sync_source, sizeof(g_last_sync_source), "%s", source);
+    struct tm utc_tm = {0};
+    gmtime_r(&epoch_utc, &utc_tm);
+    strftime(g_config_date, sizeof(g_config_date), "%d-%m-%Y", &utc_tm);
+    strftime(g_config_time, sizeof(g_config_time), "%H:%M:%S", &utc_tm);
+    return ESP_OK;
+}
+
+static void sntp_time_sync_cb(struct timeval *tv) {
+    time_t epoch = tv ? tv->tv_sec : time(NULL);
+    esp_err_t err = captive_manager_offer_time_epoch(epoch, "ntp");
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Sincronizacion NTP recibida pero no aceptada: %s", esp_err_to_name(err));
+    }
+}
+
+static void start_sntp_if_needed(void) {
+    if (g_sntp_started) return;
+    g_sntp_started = true;
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_set_time_sync_notification_cb(sntp_time_sync_cb);
+    esp_sntp_init();
+    ESP_LOGI(TAG, "SNTP iniciado en segundo plano");
 }
 
 bool captive_manager_can_measure(void) {
@@ -175,19 +260,17 @@ static esp_err_t apply_device_time(const char *date, const char *time_text) {
     tm_value.tm_hour = (time_text[0] - '0') * 10 + (time_text[1] - '0');
     tm_value.tm_min = (time_text[3] - '0') * 10 + (time_text[4] - '0');
     tm_value.tm_sec = (time_text[6] - '0') * 10 + (time_text[7] - '0');
-    tm_value.tm_isdst = -1;
+    tm_value.tm_isdst = 0;
 
-    time_t epoch = mktime(&tm_value);
+    time_t epoch = utc_fields_to_epoch(tm_value.tm_year + 1900, tm_value.tm_mon + 1, tm_value.tm_mday,
+                                       tm_value.tm_hour, tm_value.tm_min, tm_value.tm_sec);
     if (epoch < 0) return ESP_ERR_INVALID_ARG;
 
-    struct timeval now = { .tv_sec = epoch, .tv_usec = 0 };
-    if (settimeofday(&now, NULL) != 0) return ESP_FAIL;
+    esp_err_t offer_err = captive_manager_offer_time_epoch(epoch, "server");
+    if (offer_err != ESP_OK) return offer_err;
 
     snprintf(g_config_date, sizeof(g_config_date), "%s", date);
     snprintf(g_config_time, sizeof(g_config_time), "%s", time_text);
-    g_time_valid = true;
-    snprintf(g_last_sync_source, sizeof(g_last_sync_source), "server");
-
     device_time_cfg_t cfg = {0};
     cfg.valid = true;
     snprintf(cfg.date, sizeof(cfg.date), "%s", date);
@@ -215,6 +298,8 @@ static void load_saved_device_time(void) {
 esp_err_t captive_manager_init(const captive_manager_cfg_t *cfg) {
     if (!cfg) return ESP_ERR_INVALID_ARG;
     g_cfg = *cfg;
+    setenv("TZ", "CST6", 1);
+    tzset();
     g_boot_id = esp_random();
     if (g_boot_id == 0) {
         g_boot_id = 1;
@@ -426,6 +511,7 @@ void captive_manager_notify_sta_got_ip(void) {
         ESP_LOGE(TAG, "No se pudo iniciar HTTP en STA: %s", esp_err_to_name(http_err));
     }
     set_state(CAP_STATE_OPERATIONAL);
+    start_sntp_if_needed();
     ESP_LOGI(TAG, "STA connected and operational; HTTP endpoints available on port 80");
 }
 
@@ -744,7 +830,13 @@ static esp_err_t status_get(httpd_req_t *r) {
     cJSON_AddNumberToObject(root, "current_uptime_s", (double)(esp_timer_get_time() / 1000000ULL));
     cJSON_AddBoolToObject(root, "time_valid", g_time_valid);
     cJSON_AddBoolToObject(root, "needs_time_sync", !g_time_valid);
+    cJSON_AddStringToObject(root, "time_source", g_time_valid ? g_last_sync_source : "none");
     cJSON_AddStringToObject(root, "last_sync_source", g_last_sync_source);
+    if (g_time_valid) {
+        cJSON_AddNumberToObject(root, "current_epoch", (double)time(NULL));
+    } else {
+        cJSON_AddNullToObject(root, "current_epoch");
+    }
     if (g_push_host[0]) {
         cJSON_AddStringToObject(root, "push_host", g_push_host);
     } else {
@@ -777,6 +869,14 @@ static esp_err_t status_get(httpd_req_t *r) {
         cJSON_AddNullToObject(root, "last_measurement_timestamp");
     }
     cJSON_AddBoolToObject(root, "last_measurement_time_valid", g_last_readings.time_valid);
+    cJSON_AddStringToObject(root, "last_measurement_time_source",
+                            g_last_readings.time_source[0] ? g_last_readings.time_source : "none");
+    time_t last_measurement_epoch = 0;
+    if (g_last_readings.time_valid && parse_utc_timestamp(g_last_readings.timestamp, &last_measurement_epoch)) {
+        cJSON_AddNumberToObject(root, "last_measurement_epoch", (double)last_measurement_epoch);
+    } else {
+        cJSON_AddNullToObject(root, "last_measurement_epoch");
+    }
     cJSON_AddBoolToObject(root, "gps_valid", g_last_readings.gps_valid);
     if (g_last_readings.gps_valid) {
         cJSON_AddNumberToObject(root, "gps_lat", g_last_readings.gps_lat);
@@ -844,7 +944,8 @@ static esp_err_t lecturas_get(httpd_req_t *r) {
             cJSON_AddNumberToObject(root, "boot_id", g_last_readings.boot_id);
             cJSON_AddNumberToObject(root, "uptime_s", g_last_readings.uptime_s);
             cJSON_AddBoolToObject(root, "time_valid", g_last_readings.time_valid);
-            cJSON_AddStringToObject(root, "time_source", g_last_readings.time_valid ? "esp" : "pending_estimate");
+            cJSON_AddStringToObject(root, "time_source",
+                                    g_last_readings.time_source[0] ? g_last_readings.time_source : "none");
             if (g_last_readings.timestamp[0]) {
                 cJSON_AddStringToObject(root, "timestamp", g_last_readings.timestamp);
             } else {
@@ -1069,7 +1170,8 @@ static esp_err_t download_web_asset_to_sd(const char *url, const char *name, siz
 
 
 static esp_err_t tabla_get(httpd_req_t *r) {
-    if (serve_sd_web_file(r, "in.htm")) return ESP_OK;
+    /* La vista compilada es la fuente autoritativa. Un in.htm antiguo en la SD
+       no debe volver a cortar timestamps UTC sin convertirlos. */
 
     const char *device_id = (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor";
     char display_id[64];
@@ -1125,11 +1227,14 @@ static esp_err_t tabla_get(httpd_req_t *r) {
         snprintf(buf, sizeof(buf), "<tr><td>Humedad</td><td>%.2f</td><td>%%</td></tr>", g_last_readings.hum); httpd_resp_send_chunk(r, buf, -1);
         httpd_resp_send_chunk(r, "</table>", -1);
 
-        if (g_last_readings.timestamp[0] && strlen(g_last_readings.timestamp) >= 19) {
+        time_t measurement_epoch = 0;
+        if (g_last_readings.time_valid && parse_utc_timestamp(g_last_readings.timestamp, &measurement_epoch)) {
             char date_text[11];
             char time_text[9];
-            snprintf(date_text, sizeof(date_text), "%.2s-%.2s-%.4s", g_last_readings.timestamp + 8, g_last_readings.timestamp + 5, g_last_readings.timestamp);
-            snprintf(time_text, sizeof(time_text), "%.8s", g_last_readings.timestamp + 11);
+            struct tm local_tm = {0};
+            localtime_r(&measurement_epoch, &local_tm);
+            strftime(date_text, sizeof(date_text), "%d-%m-%Y", &local_tm);
+            strftime(time_text, sizeof(time_text), "%H:%M:%S", &local_tm);
             snprintf(buf, sizeof(buf), "<p class=\"estado\">Fecha de última medición: <span>%s</span></p>", date_text);
             httpd_resp_send_chunk(r, buf, -1);
             snprintf(buf, sizeof(buf), "<p class=\"estado\">Hora última medición: <span>%s</span></p>", time_text);
@@ -1411,26 +1516,6 @@ static esp_err_t config_post(httpd_req_t *r) {
     cJSON *root = cJSON_Parse(buf);
     if (!root) return httpd_resp_send_err(r, 400, "json");
 
-    cJSON *j_date = cJSON_GetObjectItem(root, "date");
-    cJSON *j_time = cJSON_GetObjectItem(root, "time");
-    if (!cJSON_IsString(j_date)) {
-        j_date = cJSON_GetObjectItem(root, "fecha");
-    }
-    if (!cJSON_IsString(j_time)) {
-        j_time = cJSON_GetObjectItem(root, "hora");
-    }
-
-    if (!cJSON_IsString(j_date) || !cJSON_IsString(j_time)) {
-        cJSON_Delete(root);
-        return httpd_resp_send_err(r, 400, "date/time required");
-    }
-
-    esp_err_t err = apply_device_time(j_date->valuestring, j_time->valuestring);
-    if (err != ESP_OK) {
-        cJSON_Delete(root);
-        return httpd_resp_send_err(r, 400, "invalid date/time");
-    }
-
     cJSON *j_push_host = cJSON_GetObjectItem(root, "push_host");
     if (!cJSON_IsString(j_push_host)) {
         j_push_host = cJSON_GetObjectItem(root, "server_ip");
@@ -1441,10 +1526,41 @@ static esp_err_t config_post(httpd_req_t *r) {
         ESP_LOGI(TAG, "Push host configurado por servidor: %s", g_push_host);
     }
 
+    esp_err_t err = ESP_OK;
+    cJSON *j_epoch = cJSON_GetObjectItem(root, "epoch");
+    if (!cJSON_IsNumber(j_epoch)) {
+        j_epoch = cJSON_GetObjectItem(root, "unix_epoch");
+    }
+    cJSON *j_date = cJSON_GetObjectItem(root, "date");
+    cJSON *j_time = cJSON_GetObjectItem(root, "time");
+    if (!cJSON_IsString(j_date)) {
+        j_date = cJSON_GetObjectItem(root, "fecha");
+    }
+    if (!cJSON_IsString(j_time)) {
+        j_time = cJSON_GetObjectItem(root, "hora");
+    }
+
+    if (cJSON_IsNumber(j_epoch)) {
+        err = captive_manager_offer_time_epoch((time_t)j_epoch->valuedouble, "server");
+    } else if (cJSON_IsString(j_date) && cJSON_IsString(j_time)) {
+        err = apply_device_time(j_date->valuestring, j_time->valuestring);
+    } else {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(r, 400, "epoch or date/time required");
+    }
+
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(r, 400, "invalid time");
+    }
+
     cJSON *out = cJSON_CreateObject();
     cJSON_AddBoolToObject(out, "ok", true);
     cJSON_AddStringToObject(out, "device_id", (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor");
     cJSON_AddBoolToObject(out, "time_valid", g_time_valid);
+    cJSON_AddNumberToObject(out, "current_epoch", g_time_valid ? (double)time(NULL) : 0.0);
+    cJSON_AddStringToObject(out, "time_source", g_time_valid ? g_last_sync_source : "none");
+    cJSON_AddBoolToObject(out, "time_applied", err == ESP_OK);
     cJSON_AddStringToObject(out, "date", g_config_date);
     cJSON_AddStringToObject(out, "time", g_config_time);
     char *text = cJSON_PrintUnformatted(out);
@@ -1453,7 +1569,8 @@ static esp_err_t config_post(httpd_req_t *r) {
     free(text);
     cJSON_Delete(out);
     cJSON_Delete(root);
-    ESP_LOGI(TAG, "Fecha/hora configurada por servidor: %s %s", g_config_date, g_config_time);
+    ESP_LOGI(TAG, "Configuracion del servidor procesada; fuente=%s aplicada=%s",
+             g_last_sync_source, err == ESP_OK ? "si" : "no");
     return ESP_OK;
 }
 
@@ -1724,6 +1841,37 @@ static void get_current_datetime_string(char *buf, size_t buf_size) {
     time(&now);
     localtime_r(&now, &tm_now);
     strftime(buf, buf_size, "%d-%m-%Y %H:%M:%S", &tm_now);
+}
+
+static bool parse_utc_timestamp(const char *timestamp, time_t *epoch_out) {
+    if (!timestamp || !epoch_out || strlen(timestamp) < 20 || timestamp[19] != 'Z') {
+        return false;
+    }
+    int year, month, day, hour, minute, second;
+    if (sscanf(timestamp, "%4d-%2d-%2dT%2d:%2d:%2dZ",
+               &year, &month, &day, &hour, &minute, &second) != 6) {
+        return false;
+    }
+    struct tm tm_utc = {
+        .tm_year = year - 1900,
+        .tm_mon = month - 1,
+        .tm_mday = day,
+        .tm_hour = hour,
+        .tm_min = minute,
+        .tm_sec = second,
+        .tm_isdst = 0,
+    };
+    time_t epoch = utc_fields_to_epoch(year, month, day, hour, minute, second);
+    struct tm check = {0};
+    gmtime_r(&epoch, &check);
+    if (epoch < (time_t)MIN_VALID_EPOCH || check.tm_year != tm_utc.tm_year ||
+        check.tm_mon != tm_utc.tm_mon || check.tm_mday != tm_utc.tm_mday ||
+        check.tm_hour != tm_utc.tm_hour || check.tm_min != tm_utc.tm_min ||
+        check.tm_sec != tm_utc.tm_sec) {
+        return false;
+    }
+    *epoch_out = epoch;
+    return true;
 }
 
 static void get_active_ip_string(char *buf, size_t buf_size) {

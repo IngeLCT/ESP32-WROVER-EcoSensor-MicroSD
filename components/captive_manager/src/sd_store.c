@@ -22,7 +22,7 @@ static const char *MOUNT_POINT = "/sdcard";
 static const char *CSV_PATH = "/sdcard/data.csv";
 static const char *CSV_TMP_PATH = "/sdcard/data.tmp";
 static const char *CSV_BAK_PATH = "/sdcard/data.bak";
-static const char *CSV_HEADER = "id,boot_id,uptime_s,time_valid,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,scd_temp,scd_hum,sen_temp,sen_hum,gps_valid,gps_lat,gps_lon,gps_satellites,gps_hdop,gps_age_ms,window_s\n";
+static const char *CSV_HEADER = "id,boot_id,uptime_s,time_valid,time_source,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,scd_temp,scd_hum,sen_temp,sen_hum,gps_valid,gps_lat,gps_lon,gps_satellites,gps_hdop,gps_age_ms,window_s\n";
 #define STREAM_EXPORT_BATCH_ROWS 64
 
 static bool g_ready = false;
@@ -109,8 +109,9 @@ static void ensure_header(void) {
         char first_line[512] = {0};
         bool has_header = fgets(first_line, sizeof(first_line), existing) != NULL;
         bool first_line_is_header = has_header && strncmp(first_line, "id,", 3) == 0;
-        bool header_has_gps = has_header && strstr(first_line, "gps_lat") != NULL && strstr(first_line, "gps_lon") != NULL;
-        if (header_has_gps) {
+        bool header_is_current = has_header && strstr(first_line, "gps_lat") != NULL &&
+                                 strstr(first_line, "gps_lon") != NULL && strstr(first_line, "time_source") != NULL;
+        if (header_is_current) {
             fclose(existing);
             if (unlink(CSV_BAK_PATH) != 0 && errno != ENOENT) {
                 ESP_LOGW(TAG, "CSV valido, pero no se pudo borrar respaldo antiguo: errno=%d (%s)", errno, strerror(errno));
@@ -119,7 +120,7 @@ static void ensure_header(void) {
             return;
         }
 
-        ESP_LOGW(TAG, "CSV existente sin encabezado GPS; migrando encabezado sin borrar mediciones");
+        ESP_LOGW(TAG, "CSV existente con encabezado anterior; actualizando sin borrar mediciones");
         FILE *tmp = fopen(CSV_TMP_PATH, "w");
         if (!tmp) {
             fclose(existing);
@@ -390,11 +391,12 @@ esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uin
 
     long row_offset = ftell(f);
     int written = fprintf(f,
-                          "%lu,%lu,%lu,%u,%s,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%.6f,%.6f,%u,%.2f,%lu,%lu\n",
+                          "%lu,%lu,%lu,%u,%s,%s,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%.6f,%.6f,%u,%.2f,%lu,%lu\n",
                           (unsigned long)id,
                           (unsigned long)reading->boot_id,
                           (unsigned long)reading->uptime_s,
                           reading->time_valid ? 1U : 0U,
+                          reading->time_source[0] ? reading->time_source : "none",
                           reading->timestamp,
                           reading->co2,
                           reading->pm1p0,
@@ -455,6 +457,7 @@ typedef struct {
     uint32_t boot_id;
     uint32_t uptime_s;
     bool time_valid;
+    char time_source[16];
     char timestamp[32];
     uint32_t co2;
     float pm1p0;
@@ -532,9 +535,34 @@ static bool parse_csv_line(const char *line, sd_store_row_t *row) {
     char copy[512];
     snprintf(copy, sizeof(copy), "%s", line);
 
-    char *fields[28] = {0};
-    int n = split_csv_simple(copy, fields, 28);
+    char *fields[30] = {0};
+    int n = split_csv_simple(copy, fields, 30);
     memset(row, 0, sizeof(*row));
+
+    // Formato UTC con fuente horaria y GPS.
+    if (n >= 26 && parse_u32_field(fields[0], &row->id) && parse_u32_field(fields[1], &row->boot_id)) {
+        uint32_t time_valid = 0;
+        uint32_t gps_valid = 0;
+        bool ok = parse_u32_field(fields[2], &row->uptime_s) &&
+               parse_u32_field(fields[3], &time_valid) &&
+               (row->time_valid = time_valid != 0, true) &&
+               (snprintf(row->time_source, sizeof(row->time_source), "%s", fields[4] ? fields[4] : "none"), true) &&
+               (snprintf(row->timestamp, sizeof(row->timestamp), "%s", fields[5] ? fields[5] : ""), true) &&
+               parse_u32_field(fields[6], &row->co2) &&
+               parse_float_field(fields[7], &row->pm1p0) && parse_float_field(fields[8], &row->pm2p5) &&
+               parse_float_field(fields[9], &row->pm4p0) && parse_float_field(fields[10], &row->pm10p0) &&
+               parse_float_field(fields[11], &row->voc) && parse_float_field(fields[12], &row->nox) &&
+               parse_float_field(fields[13], &row->temp) && parse_float_field(fields[14], &row->hum) &&
+               parse_float_field(fields[15], &row->scd_temp) && parse_float_field(fields[16], &row->scd_hum) &&
+               parse_float_field(fields[17], &row->sen_temp) && parse_float_field(fields[18], &row->sen_hum) &&
+               parse_u32_field(fields[19], &gps_valid) &&
+               (row->gps_lat = strtod(fields[20] ? fields[20] : "0", NULL), true) &&
+               (row->gps_lon = strtod(fields[21] ? fields[21] : "0", NULL), true) &&
+               parse_u32_field(fields[22], &row->gps_satellites) && parse_float_field(fields[23], &row->gps_hdop) &&
+               parse_u32_field(fields[24], &row->gps_age_ms) && parse_u32_field(fields[25], &row->window_s);
+        row->gps_valid = gps_valid != 0;
+        return ok;
+    }
 
     // Formato nuevo con GPS:
     // id,boot_id,uptime_s,time_valid,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,scd_temp,scd_hum,sen_temp,sen_hum,gps_valid,gps_lat,gps_lon,gps_satellites,gps_hdop,gps_age_ms,window_s
@@ -566,6 +594,7 @@ static bool parse_csv_line(const char *line, sd_store_row_t *row) {
                parse_u32_field(fields[23], &row->gps_age_ms) &&
                parse_u32_field(fields[24], &row->window_s);
         row->gps_valid = gps_valid != 0;
+        snprintf(row->time_source, sizeof(row->time_source), "%s", row->time_valid ? "esp" : "uptime");
         return ok;
     }
 
@@ -653,7 +682,8 @@ static void add_row_fields(cJSON *row, const sd_store_row_t *parsed) {
     cJSON_AddNumberToObject(row, "boot_id", parsed->boot_id);
     cJSON_AddNumberToObject(row, "uptime_s", parsed->uptime_s);
     cJSON_AddBoolToObject(row, "time_valid", parsed->time_valid);
-    cJSON_AddStringToObject(row, "time_source", parsed->time_valid ? "esp" : "pending_estimate");
+    cJSON_AddStringToObject(row, "time_source",
+                            parsed->time_source[0] ? parsed->time_source : (parsed->time_valid ? "esp" : "uptime"));
     if (parsed->timestamp[0]) {
         cJSON_AddStringToObject(row, "timestamp", parsed->timestamp);
     } else {
@@ -733,7 +763,7 @@ static esp_err_t write_row_ndjson(const sd_store_row_t *parsed, sd_store_ndjson_
         (unsigned long)parsed->boot_id,
         (unsigned long)parsed->uptime_s,
         parsed->time_valid ? "true" : "false",
-        parsed->time_valid ? "esp" : "pending_estimate",
+        parsed->time_source[0] ? parsed->time_source : (parsed->time_valid ? "esp" : "uptime"),
         timestamp_field,
         (unsigned long)parsed->co2,
         parsed->pm1p0,

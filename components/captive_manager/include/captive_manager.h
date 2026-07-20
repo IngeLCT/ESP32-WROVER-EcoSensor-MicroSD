@@ -2,6 +2,7 @@
 #include "esp_err.h"
 #include "stdbool.h"
 #include <stdint.h>
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,6 +39,7 @@ typedef struct {
     uint32_t window_s;
     bool time_valid;
     char timestamp[32];
+    char time_source[16];
     uint16_t co2;
     float pm1p0;
     float pm2p5;
@@ -74,6 +76,9 @@ bool captive_manager_using_saved(void);
 void captive_manager_set_sensors_started(bool started);
 void captive_manager_set_last_readings(const captive_manager_readings_t *readings);
 bool captive_manager_time_is_valid(void);
+const char *captive_manager_time_source(void);
+time_t captive_manager_current_epoch(void);
+esp_err_t captive_manager_offer_time_epoch(time_t epoch_utc, const char *source);
 bool captive_manager_can_measure(void);
 bool captive_manager_can_push_measurements(void);
 const char *captive_manager_push_host(void);

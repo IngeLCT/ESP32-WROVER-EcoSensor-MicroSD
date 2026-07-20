@@ -63,6 +63,13 @@ static TaskHandle_t s_push_task_handle = NULL;
 static QueueHandle_t s_measurement_push_queue = NULL;
 static bool s_sensors_started = false;
 
+static void gps_time_available(time_t epoch_utc) {
+    esp_err_t err = captive_manager_offer_time_epoch(epoch_utc, "gps");
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Hora GPS valida no aceptada: %s", esp_err_to_name(err));
+    }
+}
+
 static esp_err_t post_measurement_payload(const captive_manager_readings_t *reading) {
     if (!reading || !captive_manager_can_push_measurements()) {
         return ESP_ERR_INVALID_STATE;
@@ -87,7 +94,7 @@ static esp_err_t post_measurement_payload(const captive_manager_readings_t *read
                        (unsigned long)reading->boot_id,
                        (unsigned long)reading->uptime_s,
                        reading->time_valid ? "true" : "false",
-                       reading->time_valid ? "esp" : "device_uptime",
+                       reading->time_source[0] ? reading->time_source : "none",
                        reading->time_valid ? reading->timestamp : "",
                        reading->pm1p0,
                        reading->pm2p5,
@@ -265,10 +272,13 @@ static void publish_latest_average(const SensorData *avg) {
 
     snapshot.time_valid = captive_manager_time_is_valid();
     if (snapshot.time_valid) {
+        snprintf(snapshot.time_source, sizeof(snapshot.time_source), "%s", captive_manager_time_source());
         time_t now = time(NULL);
         struct tm utc_tm = {0};
         gmtime_r(&now, &utc_tm);
         strftime(snapshot.timestamp, sizeof(snapshot.timestamp), "%Y-%m-%dT%H:%M:%SZ", &utc_tm);
+    } else {
+        snprintf(snapshot.time_source, sizeof(snapshot.time_source), "uptime");
     }
 
     uint32_t measurement_id = 0;
@@ -508,6 +518,7 @@ void app_main(void)
     };
 
     ESP_ERROR_CHECK(captive_manager_init(&cfg));
+    gps_set_time_callback(gps_time_available);
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &wifi_event_handler, NULL));
     captive_manager_set_sensors_started(false);
