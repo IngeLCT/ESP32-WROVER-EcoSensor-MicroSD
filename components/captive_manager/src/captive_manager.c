@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <dirent.h>
+#include <stdint.h>
 
 static const char *TAG = "wifi_manager";
 
@@ -53,6 +54,20 @@ static bool g_sntp_started = false;
 
 #define MIN_VALID_EPOCH 1704067200LL /* 2024-01-01T00:00:00Z */
 #define TIME_ADJUST_THRESHOLD_SECONDS 10
+
+static bool parse_query_u32(const char *text, uint32_t *value) {
+    if (!text || !text[0] || !value || text[0] == '-') {
+        return false;
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(text, &end, 10);
+    if (errno == ERANGE || end == text || *end != '\0' || parsed > UINT32_MAX) {
+        return false;
+    }
+    *value = (uint32_t)parsed;
+    return true;
+}
 
 static void restart_later_task(void *arg) {
     vTaskDelay(pdMS_TO_TICKS(800));
@@ -827,10 +842,13 @@ static esp_err_t status_get(httpd_req_t *r) {
     cJSON_AddBoolToObject(root, "sd_ready", sd_store_is_ready());
     cJSON_AddNumberToObject(root, "sd_last_id", sd_store_last_id());
     cJSON_AddBoolToObject(root, "checkpoint_valid", sd_store_checkpoint_valid());
+    cJSON_AddBoolToObject(root, "checkpoint_current", sd_store_checkpoint_current());
+    cJSON_AddBoolToObject(root, "checkpoint_pending", sd_store_checkpoint_pending());
     cJSON_AddNumberToObject(root, "checkpoint_generation", (double)sd_store_checkpoint_generation());
     cJSON_AddBoolToObject(root, "history_index_ready", sd_store_history_index_ready());
     cJSON_AddBoolToObject(root, "history_index_rebuilding", sd_store_history_index_rebuilding());
     cJSON_AddNumberToObject(root, "history_index_points", sd_store_history_index_points());
+    cJSON_AddStringToObject(root, "history_index_state", sd_store_history_index_state());
     cJSON_AddNumberToObject(root, "sd_format_version", sd_store_format_version());
     cJSON_AddNumberToObject(root, "boot_id", g_boot_id);
     cJSON_AddNumberToObject(root, "current_uptime_s", (double)(esp_timer_get_time() / 1000000ULL));
@@ -1267,13 +1285,13 @@ static esp_err_t lecturas_since_get(httpd_req_t *r) {
         if (httpd_query_key_value(query, "after", value, sizeof(value)) == ESP_OK ||
             httpd_query_key_value(query, "after_id", value, sizeof(value)) == ESP_OK ||
             httpd_query_key_value(query, "since", value, sizeof(value)) == ESP_OK) {
-            after_id = (uint32_t)strtoul(value, NULL, 10);
+            if (!parse_query_u32(value, &after_id)) return httpd_resp_send_err(r, 400, "after_id fuera de rango");
         }
         if (httpd_query_key_value(query, "limit", value, sizeof(value)) == ESP_OK) {
-            limit = (uint32_t)strtoul(value, NULL, 10);
+            if (!parse_query_u32(value, &limit)) return httpd_resp_send_err(r, 400, "limit fuera de rango");
         }
         if (httpd_query_key_value(query, "timeout_ms", value, sizeof(value)) == ESP_OK) {
-            timeout_ms = (uint32_t)strtoul(value, NULL, 10);
+            if (!parse_query_u32(value, &timeout_ms)) return httpd_resp_send_err(r, 400, "timeout_ms fuera de rango");
         }
     }
 
@@ -1321,17 +1339,17 @@ static esp_err_t lecturas_range_get(httpd_req_t *r) {
         char value[24] = {0};
         if (httpd_query_key_value(query, "from", value, sizeof(value)) == ESP_OK ||
             httpd_query_key_value(query, "from_id", value, sizeof(value)) == ESP_OK) {
-            from_id = (uint32_t)strtoul(value, NULL, 10);
+            if (!parse_query_u32(value, &from_id)) return httpd_resp_send_err(r, 400, "from_id fuera de rango");
         }
         if (httpd_query_key_value(query, "to", value, sizeof(value)) == ESP_OK ||
             httpd_query_key_value(query, "to_id", value, sizeof(value)) == ESP_OK) {
-            to_id = (uint32_t)strtoul(value, NULL, 10);
+            if (!parse_query_u32(value, &to_id)) return httpd_resp_send_err(r, 400, "to_id fuera de rango");
         }
         if (httpd_query_key_value(query, "limit", value, sizeof(value)) == ESP_OK) {
-            limit = (uint32_t)strtoul(value, NULL, 10);
+            if (!parse_query_u32(value, &limit)) return httpd_resp_send_err(r, 400, "limit fuera de rango");
         }
         if (httpd_query_key_value(query, "timeout_ms", value, sizeof(value)) == ESP_OK) {
-            timeout_ms = (uint32_t)strtoul(value, NULL, 10);
+            if (!parse_query_u32(value, &timeout_ms)) return httpd_resp_send_err(r, 400, "timeout_ms fuera de rango");
         }
     }
 
@@ -1387,14 +1405,14 @@ static esp_err_t lecturas_export_get(httpd_req_t *r) {
         char value[24] = {0};
         if (httpd_query_key_value(query, "from", value, sizeof(value)) == ESP_OK ||
             httpd_query_key_value(query, "from_id", value, sizeof(value)) == ESP_OK) {
-            from_id = (uint32_t)strtoul(value, NULL, 10);
+            if (!parse_query_u32(value, &from_id)) return httpd_resp_send_err(r, 400, "from_id fuera de rango");
         }
         if (httpd_query_key_value(query, "to", value, sizeof(value)) == ESP_OK ||
             httpd_query_key_value(query, "to_id", value, sizeof(value)) == ESP_OK) {
-            to_id = (uint32_t)strtoul(value, NULL, 10);
+            if (!parse_query_u32(value, &to_id)) return httpd_resp_send_err(r, 400, "to_id fuera de rango");
         }
         if (httpd_query_key_value(query, "timeout_ms", value, sizeof(value)) == ESP_OK) {
-            timeout_ms = (uint32_t)strtoul(value, NULL, 10);
+            if (!parse_query_u32(value, &timeout_ms)) return httpd_resp_send_err(r, 400, "timeout_ms fuera de rango");
         }
     }
 
@@ -1428,17 +1446,17 @@ static esp_err_t lecturas_recent_get(httpd_req_t *r) {
         char value[24] = {0};
         if (httpd_query_key_value(query, "after", value, sizeof(value)) == ESP_OK ||
             httpd_query_key_value(query, "after_id", value, sizeof(value)) == ESP_OK) {
-            after_id = (uint32_t)strtoul(value, NULL, 10);
+            if (!parse_query_u32(value, &after_id)) return httpd_resp_send_err(r, 400, "after_id fuera de rango");
         }
         if (httpd_query_key_value(query, "before", value, sizeof(value)) == ESP_OK ||
             httpd_query_key_value(query, "before_id", value, sizeof(value)) == ESP_OK) {
-            before_id = (uint32_t)strtoul(value, NULL, 10);
+            if (!parse_query_u32(value, &before_id)) return httpd_resp_send_err(r, 400, "before_id fuera de rango");
         }
         if (httpd_query_key_value(query, "limit", value, sizeof(value)) == ESP_OK) {
-            limit = (uint32_t)strtoul(value, NULL, 10);
+            if (!parse_query_u32(value, &limit)) return httpd_resp_send_err(r, 400, "limit fuera de rango");
         }
         if (httpd_query_key_value(query, "timeout_ms", value, sizeof(value)) == ESP_OK) {
-            timeout_ms = (uint32_t)strtoul(value, NULL, 10);
+            if (!parse_query_u32(value, &timeout_ms)) return httpd_resp_send_err(r, 400, "timeout_ms fuera de rango");
         }
     }
 
@@ -1490,12 +1508,22 @@ static esp_err_t wifi_clear_get(httpd_req_t *r) {
 
 static esp_err_t readings_clear_delete(httpd_req_t *r) {
     esp_err_t err = sd_store_clear();
+    if (err == ESP_OK) {
+        memset(&g_last_readings, 0, sizeof(g_last_readings));
+    }
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "ok", err == ESP_OK);
     cJSON_AddStringToObject(root, "device_id", (g_cfg.mdns_hostname && g_cfg.mdns_hostname[0]) ? g_cfg.mdns_hostname : "ecosensor");
     cJSON_AddBoolToObject(root, "sd_ready", sd_store_is_ready());
     cJSON_AddNumberToObject(root, "last_id", sd_store_last_id());
+    cJSON_AddNumberToObject(root, "sd_last_id", sd_store_last_id());
+    cJSON_AddNumberToObject(root, "last_measurement_id", g_last_readings.measurement_id);
+    cJSON_AddBoolToObject(root, "checkpoint_valid", sd_store_checkpoint_valid());
+    cJSON_AddBoolToObject(root, "checkpoint_current", sd_store_checkpoint_current());
+    cJSON_AddBoolToObject(root, "checkpoint_pending", sd_store_checkpoint_pending());
+    cJSON_AddBoolToObject(root, "history_index_ready", sd_store_history_index_ready());
+    cJSON_AddNumberToObject(root, "history_index_points", sd_store_history_index_points());
     if (err != ESP_OK) {
         cJSON_AddStringToObject(root, "error", esp_err_to_name(err));
     }

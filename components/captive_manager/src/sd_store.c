@@ -25,11 +25,13 @@ static const char *MOUNT_POINT = "/sdcard";
 static const char *CSV_PATH = "/sdcard/data.csv";
 static const char *CSV_TMP_PATH = "/sdcard/data.tmp";
 static const char *CSV_BAK_PATH = "/sdcard/data.bak";
-static const char *STATE_A_PATH = "/sdcard/data_state_a.bin";
-static const char *STATE_B_PATH = "/sdcard/data_state_b.bin";
+/* El proyecto usa CONFIG_FATFS_LFN_NONE: todos los auxiliares deben cumplir 8.3. */
+static const char *STATE_A_PATH = "/sdcard/statea.bin";
+static const char *STATE_B_PATH = "/sdcard/stateb.bin";
 static const char *INDEX_PATH = "/sdcard/data.idx";
-static const char *INDEX_TMP_PATH = "/sdcard/data.idx.tmp";
-static const char *INDEX_BAK_PATH = "/sdcard/data.idx.bak";
+static const char *INDEX_TMP_PATH = "/sdcard/idx.tmp";
+static const char *INDEX_BAK_PATH = "/sdcard/idx.bak";
+static const char *INDEX_BLOCK_PATH = "/sdcard/idx.blk";
 static const char *CSV_HEADER = "id,boot_id,uptime_s,time_valid,time_source,timestamp,co2,pm1p0,pm2p5,pm4p0,pm10p0,voc,nox,temp,hum,scd_temp,scd_hum,sen_temp,sen_hum,gps_valid,gps_lat,gps_lon,gps_satellites,gps_hdop,gps_age_ms,window_s\n";
 #define STREAM_EXPORT_BATCH_ROWS 64
 #define CSV_FORMAT_VERSION 3U
@@ -39,6 +41,19 @@ static const char *CSV_HEADER = "id,boot_id,uptime_s,time_valid,time_source,time
 #define INDEX_VERSION 1U
 #define INDEX_INTERVAL 64U
 #define REBUILD_CHUNK_ROWS 128U
+#define CHECKPOINT_FLAG_HISTORY_VERIFIED (1UL << 0)
+#define CHECKPOINT_FLAG_INDEX_DISCONTINUITY (1UL << 1)
+
+typedef enum {
+    INDEX_MISSING = 0,
+    INDEX_PENDING,
+    INDEX_REBUILDING,
+    INDEX_READY,
+    INDEX_INVALID_DISCONTINUITY,
+    INDEX_FAILED_MEMORY,
+    INDEX_FAILED_IO,
+    INDEX_CANCELLED,
+} sd_index_state_t;
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -75,13 +90,25 @@ typedef struct __attribute__((packed)) {
     uint32_t entry_crc;
 } sd_index_entry_t;
 
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint64_t csv_size;
+    uint32_t last_id;
+    uint32_t crc;
+} sd_index_block_t;
+
+#define INDEX_BLOCK_MAGIC 0x4553424CUL /* ESBL */
+
 static bool g_ready = false;
 static uint32_t g_last_id = 0;
 static SemaphoreHandle_t g_lock = NULL;
-static sd_checkpoint_t g_checkpoint = {0};
-static bool g_checkpoint_valid = false;
+static sd_checkpoint_t g_runtime_state = {0};
+static sd_checkpoint_t g_persisted_checkpoint = {0};
+static bool g_persisted_checkpoint_valid = false;
+static bool g_checkpoint_pending = false;
 static bool g_index_ready = false;
 static bool g_index_rebuilding = false;
+static sd_index_state_t g_index_state = INDEX_MISSING;
 static uint32_t g_rebuild_token = 0;
 static sd_index_entry_t *g_index_entries = NULL;
 static uint32_t g_index_count = 0;
@@ -106,8 +133,12 @@ static bool sync_file(FILE *f) {
 static bool ensure_index_capacity(uint32_t count) {
     if (count <= g_index_capacity) return true;
     uint32_t capacity = g_index_capacity ? g_index_capacity : 32U;
-    while (capacity < count) capacity *= 2U;
-    sd_index_entry_t *entries = realloc(g_index_entries, capacity * sizeof(*entries));
+    while (capacity < count) {
+        if (capacity > UINT32_MAX / 2U) return false;
+        capacity *= 2U;
+    }
+    if ((size_t)capacity > SIZE_MAX / sizeof(*g_index_entries)) return false;
+    sd_index_entry_t *entries = realloc(g_index_entries, (size_t)capacity * sizeof(*entries));
     if (!entries) return false;
     g_index_entries = entries;
     g_index_capacity = capacity;
@@ -146,6 +177,34 @@ static long get_id_offset(uint32_t id) {
 static bool file_exists(const char *path) {
     struct stat st = {0};
     return stat(path, &st) == 0;
+}
+
+static uint32_t index_block_crc(const sd_index_block_t *block) {
+    return crc32_update(0, block, offsetof(sd_index_block_t, crc));
+}
+
+static bool index_rebuild_blocked_for_runtime(void) {
+    FILE *f = fopen(INDEX_BLOCK_PATH, "rb");
+    if (!f) return false;
+    sd_index_block_t block = {0};
+    bool ok = fread(&block, 1, sizeof(block), f) == sizeof(block) && fgetc(f) == EOF;
+    fclose(f);
+    return ok && block.magic == INDEX_BLOCK_MAGIC && block.crc == index_block_crc(&block) &&
+           block.csv_size == g_runtime_state.csv_size && block.last_id == g_runtime_state.last_id;
+}
+
+static void persist_index_rebuild_block(void) {
+    sd_index_block_t block = {
+        .magic = INDEX_BLOCK_MAGIC,
+        .csv_size = g_runtime_state.csv_size,
+        .last_id = g_runtime_state.last_id,
+    };
+    block.crc = index_block_crc(&block);
+    FILE *f = fopen(INDEX_BLOCK_PATH, "wb");
+    if (!f) return;
+    bool ok = fwrite(&block, 1, sizeof(block), f) == sizeof(block) && sync_file(f);
+    if (fclose(f) != 0) ok = false;
+    if (!ok) unlink(INDEX_BLOCK_PATH);
 }
 
 static void ensure_header(void) {
@@ -329,7 +388,12 @@ static bool write_checkpoint_locked(const sd_checkpoint_t *source) {
     next.magic = CHECKPOINT_MAGIC;
     next.checkpoint_version = CHECKPOINT_VERSION;
     next.csv_format_version = CSV_FORMAT_VERSION;
-    next.generation = g_checkpoint_valid ? g_checkpoint.generation + 1U : 1U;
+    if (g_persisted_checkpoint_valid && g_persisted_checkpoint.generation == UINT64_MAX) {
+        ESP_LOGE(TAG, "Generacion de checkpoint agotada");
+        g_checkpoint_pending = true;
+        return false;
+    }
+    next.generation = g_persisted_checkpoint_valid ? g_persisted_checkpoint.generation + 1U : 1U;
     next.index_points = g_index_count;
     next.structure_crc = checkpoint_crc(&next);
     const char *path = (next.generation & 1U) ? STATE_A_PATH : STATE_B_PATH;
@@ -340,8 +404,15 @@ static bool write_checkpoint_locked(const sd_checkpoint_t *source) {
         ESP_LOGE(TAG, "No se pudo confirmar checkpoint %s: errno=%d (%s)", path, errno, strerror(errno));
         return false;
     }
-    g_checkpoint = next;
-    g_checkpoint_valid = true;
+    sd_checkpoint_t verified = {0};
+    if (!read_checkpoint(path, &verified) || verified.generation != next.generation) {
+        ESP_LOGE(TAG, "Checkpoint escrito no supero validacion: %s", path);
+        g_checkpoint_pending = true;
+        return false;
+    }
+    g_persisted_checkpoint = verified;
+    g_persisted_checkpoint_valid = true;
+    g_checkpoint_pending = false;
     return true;
 }
 
@@ -416,18 +487,34 @@ static bool recover_checkpoint_tail(sd_checkpoint_t *state, uint64_t actual_size
     if (!f || fseek(f, (long)state->confirmed_end_offset, SEEK_SET) != 0) { if (f) fclose(f); return false; }
     char line[512];
     uint64_t confirmed_end = state->confirmed_end_offset;
+    uint32_t expected_id = state->last_id == UINT32_MAX ? 0U : state->last_id + 1U;
     while (1) {
         long row_offset = ftell(f);
         if (!fgets(line, sizeof(line), f)) break;
         long row_end = ftell(f);
-        if (!strchr(line, '\n')) break;
+        if (!strchr(line, '\n')) {
+            ESP_LOGW(TAG, "Recuperacion detenida offset=%ld causa=fila_incompleta accion=truncar_cola", row_offset);
+            break;
+        }
         uint32_t id = 0;
-        if (!parse_line_id(line, &id) || id <= state->last_id) break;
+        if (!parse_line_id(line, &id)) {
+            ESP_LOGW(TAG, "Recuperacion detenida offset=%ld esperado=%lu causa=fila_invalida accion=truncar_cola",
+                     row_offset, (unsigned long)expected_id);
+            break;
+        }
+        if (expected_id == 0U || id != expected_id) {
+            const char *cause = id == 0U ? "id_cero" : (id < expected_id ? (id == state->last_id ? "id_duplicado" : "id_retroceso") : "salto_id");
+            ESP_LOGE(TAG,
+                     "Discontinuidad en cola offset=%ld esperado=%lu encontrado=%lu causa=%s accion=truncar_cola_no_confirmada",
+                     row_offset, (unsigned long)expected_id, (unsigned long)id, cause);
+            break;
+        }
         state->last_id = id;
         state->row_count++;
         state->last_row_offset = (uint64_t)row_offset;
         state->last_row_crc = crc32_update(0, line, strlen(line));
         confirmed_end = (uint64_t)row_end;
+        expected_id = id == UINT32_MAX ? 0U : id + 1U;
     }
     fclose(f);
     if (confirmed_end < actual_size && !truncate_csv(confirmed_end)) return false;
@@ -478,7 +565,12 @@ static bool load_index(void) {
     if (!f) return false;
     struct stat st = {0};
     bool file_size_ok = stat(INDEX_PATH, &st) == 0 && st.st_size >= (off_t)sizeof(sd_index_header_t);
-    uint32_t expected_points = g_checkpoint.last_id == 0 ? 0U : 1U + (g_checkpoint.last_id / INDEX_INTERVAL);
+    if ((g_runtime_state.flags & CHECKPOINT_FLAG_HISTORY_VERIFIED) == 0U ||
+        g_runtime_state.row_count != g_runtime_state.last_id) {
+        fclose(f);
+        return false;
+    }
+    uint32_t expected_points = g_runtime_state.last_id == 0 ? 0U : 1U + (g_runtime_state.last_id / INDEX_INTERVAL);
     sd_index_header_t header = {0};
     bool ok = file_size_ok && fread(&header, 1, sizeof(header), f) == sizeof(header) && header.magic == INDEX_MAGIC &&
               header.index_version == INDEX_VERSION && header.csv_format_version == CSV_FORMAT_VERSION &&
@@ -486,7 +578,7 @@ static bool load_index(void) {
               header.header_crc == index_header_crc(&header) &&
               header.entry_count == expected_points &&
               (uint64_t)st.st_size == sizeof(header) + (uint64_t)header.entry_count * sizeof(sd_index_entry_t) &&
-              header.csv_size <= g_checkpoint.csv_size && ensure_index_capacity(header.entry_count);
+              header.csv_size <= g_runtime_state.csv_size && ensure_index_capacity(header.entry_count);
     if (ok && header.entry_count > 0) ok = fread(g_index_entries, sizeof(*g_index_entries), header.entry_count, f) == header.entry_count;
     fclose(f);
     if (!ok || header.entries_crc != crc32_update(0, g_index_entries, header.entry_count * sizeof(*g_index_entries))) {
@@ -495,7 +587,8 @@ static bool load_index(void) {
     }
     for (uint32_t i = 0; i < header.entry_count; ++i) {
         sd_index_entry_t *entry = &g_index_entries[i];
-        if (!sparse_point_id(entry->measurement_id) || entry->csv_offset >= g_checkpoint.csv_size ||
+        uint32_t expected_point_id = i == 0U ? 1U : i * INDEX_INTERVAL;
+        if (entry->measurement_id != expected_point_id || entry->csv_offset >= g_runtime_state.csv_size ||
             entry->entry_crc != crc32_update(0, entry, offsetof(sd_index_entry_t, entry_crc)) ||
             (i > 0 && entry->measurement_id <= g_index_entries[i - 1].measurement_id)) {
             g_index_count = 0;
@@ -510,30 +603,59 @@ static void index_rebuild_task(void *arg) {
     uint32_t token = (uint32_t)(uintptr_t)arg;
     sd_index_entry_t *rebuilt = NULL;
     uint32_t count = 0, capacity = 0;
-    uint64_t snapshot_end = g_checkpoint.csv_size;
-    uint32_t snapshot_last_id = g_checkpoint.last_id;
+    uint64_t snapshot_end = g_runtime_state.csv_size;
+    uint32_t snapshot_last_id = g_runtime_state.last_id;
+    uint64_t snapshot_row_count = g_runtime_state.row_count;
+    uint32_t expected_id = 1U;
+    bool saw_header = false;
+    bool discontinuity = false;
+    uint64_t failure_offset = 0;
+    uint32_t failure_id = 0;
     bool rebuild_complete = false;
     FILE *f = fopen(CSV_PATH, "rb");
-    if (!f) goto done;
+    if (!f) {
+        g_index_state = INDEX_FAILED_IO;
+        goto done;
+    }
     char line[512];
     while (token == g_rebuild_token) {
         uint32_t chunk = 0;
         if (g_lock && xSemaphoreTake(g_lock, pdMS_TO_TICKS(1000)) != pdTRUE) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
         while (chunk++ < REBUILD_CHUNK_ROWS && (uint64_t)ftell(f) < snapshot_end && fgets(line, sizeof(line), f)) {
             long offset = ftell(f) - (long)strlen(line);
+            if (!strchr(line, '\n')) {
+                discontinuity = true; failure_offset = (uint64_t)offset; break;
+            }
+            if (!saw_header && strncmp(line, "id,", 3) == 0) { saw_header = true; continue; }
             uint32_t id = 0;
-            if (!parse_line_id(line, &id) || !sparse_point_id(id)) continue;
+            if (!parse_line_id(line, &id) || id != expected_id) {
+                discontinuity = true;
+                failure_offset = (uint64_t)offset;
+                failure_id = id;
+                break;
+            }
+            expected_id = id == UINT32_MAX ? 0U : id + 1U;
+            if (!sparse_point_id(id)) continue;
             if (count == capacity) {
                 uint32_t next = capacity ? capacity * 2U : 32U;
+                if (capacity > UINT32_MAX / 2U || (size_t)next > SIZE_MAX / sizeof(*rebuilt)) {
+                    g_index_state = INDEX_FAILED_MEMORY;
+                    if (g_lock) xSemaphoreGive(g_lock);
+                    goto close_file;
+                }
                 sd_index_entry_t *grown = realloc(rebuilt, next * sizeof(*grown));
-                if (!grown) { if (g_lock) xSemaphoreGive(g_lock); goto close_file; }
+                if (!grown) {
+                    g_index_state = INDEX_FAILED_MEMORY;
+                    if (g_lock) xSemaphoreGive(g_lock);
+                    goto close_file;
+                }
                 rebuilt = grown; capacity = next;
             }
             sd_index_entry_t *entry = &rebuilt[count++];
             memset(entry, 0, sizeof(*entry)); entry->measurement_id = id; entry->csv_offset = (uint64_t)offset;
             entry->entry_crc = crc32_update(0, entry, offsetof(sd_index_entry_t, entry_crc));
         }
-        bool finished = feof(f) || (uint64_t)ftell(f) >= snapshot_end;
+        bool finished = discontinuity || feof(f) || (uint64_t)ftell(f) >= snapshot_end;
         if (g_lock) xSemaphoreGive(g_lock);
         if (finished) { rebuild_complete = true; break; }
         vTaskDelay(pdMS_TO_TICKS(2));
@@ -543,26 +665,56 @@ close_file:
     if (token != g_rebuild_token || !rebuild_complete) goto done;
     if (g_lock) xSemaphoreTake(g_lock, portMAX_DELAY);
     if (token != g_rebuild_token) { if (g_lock) xSemaphoreGive(g_lock); goto done; }
+    uint32_t verified_last = expected_id == 0U ? UINT32_MAX : expected_id - 1U;
+    if (discontinuity || !saw_header || verified_last != snapshot_last_id || snapshot_row_count != snapshot_last_id) {
+        unlink(INDEX_TMP_PATH);
+        g_index_ready = false;
+        g_index_state = INDEX_INVALID_DISCONTINUITY;
+        g_runtime_state.flags &= ~CHECKPOINT_FLAG_HISTORY_VERIFIED;
+        g_runtime_state.flags |= CHECKPOINT_FLAG_INDEX_DISCONTINUITY;
+        persist_index_rebuild_block();
+        g_index_rebuilding = false;
+        ESP_LOGE(TAG,
+                 "Indice invalido por discontinuidad offset=%llu esperado=%lu encontrado=%lu snapshot_last=%lu row_count=%llu; no se reintentara sin cambio del CSV",
+                 (unsigned long long)failure_offset, (unsigned long)expected_id, (unsigned long)failure_id,
+                 (unsigned long)snapshot_last_id, (unsigned long long)snapshot_row_count);
+        if (g_lock) xSemaphoreGive(g_lock);
+        goto done;
+    }
     bool merge_complete = true;
     for (uint32_t i = 0; i < g_index_count; ++i) {
         if (g_index_entries[i].measurement_id <= snapshot_last_id) continue;
         if (count == capacity) {
             uint32_t next = capacity ? capacity * 2U : 32U;
+            if (capacity > UINT32_MAX / 2U || (size_t)next > SIZE_MAX / sizeof(*rebuilt)) { merge_complete = false; break; }
             sd_index_entry_t *grown = realloc(rebuilt, next * sizeof(*grown));
             if (!grown) { merge_complete = false; break; }
             rebuilt = grown; capacity = next;
         }
         rebuilt[count++] = g_index_entries[i];
     }
-    if (!merge_complete) { if (g_lock) xSemaphoreGive(g_lock); goto done; }
+    if (!merge_complete) {
+        g_index_state = INDEX_FAILED_MEMORY;
+        if (g_lock) xSemaphoreGive(g_lock);
+        goto done;
+    }
     free(g_index_entries);
     g_index_entries = rebuilt; rebuilt = NULL;
     g_index_count = count; g_index_capacity = capacity;
-    g_index_ready = persist_index_locked() && load_index();
+    g_runtime_state.flags |= CHECKPOINT_FLAG_HISTORY_VERIFIED;
+    g_runtime_state.flags &= ~CHECKPOINT_FLAG_INDEX_DISCONTINUITY;
+    unlink(INDEX_BLOCK_PATH);
+    g_runtime_state.row_count = g_runtime_state.last_id;
+    g_index_ready = persist_index_locked();
+    g_index_state = g_index_ready ? INDEX_READY : INDEX_FAILED_IO;
     g_index_rebuilding = false;
-    if (g_checkpoint_valid) write_checkpoint_locked(&g_checkpoint);
+    if (!write_checkpoint_locked(&g_runtime_state)) g_checkpoint_pending = true;
     if (g_lock) xSemaphoreGive(g_lock);
-    ESP_LOGI(TAG, "Indice disperso reconstruido: puntos=%lu intervalo=%u", (unsigned long)g_index_count, INDEX_INTERVAL);
+    if (g_index_ready) {
+        ESP_LOGI(TAG, "Indice disperso reconstruido: puntos=%lu intervalo=%u", (unsigned long)g_index_count, INDEX_INTERVAL);
+    } else {
+        ESP_LOGE(TAG, "No fue posible confirmar el indice reconstruido en la MicroSD");
+    }
 done:
     free(rebuilt);
     if (token == g_rebuild_token) g_index_rebuilding = false;
@@ -570,11 +722,13 @@ done:
 }
 
 static void start_index_rebuild(void) {
-    if (g_index_rebuilding) return;
+    if (g_index_rebuilding || g_index_state == INDEX_INVALID_DISCONTINUITY) return;
     g_index_rebuilding = true;
+    g_index_state = INDEX_REBUILDING;
     uint32_t token = ++g_rebuild_token;
     if (xTaskCreate(index_rebuild_task, "sd_index_rebuild", 4096, (void *)(uintptr_t)token, tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
         g_index_rebuilding = false;
+        g_index_state = INDEX_FAILED_MEMORY;
         ESP_LOGW(TAG, "No hay memoria para iniciar reconstruccion del indice");
     }
 }
@@ -642,10 +796,13 @@ esp_err_t sd_store_init(void) {
     bool valid_b = read_checkpoint(STATE_B_PATH, &state_b) && validate_checkpoint_row(&state_b, actual_size);
     sd_checkpoint_t recovered = {0};
     bool recovered_ok = false;
-    bool checkpoint_needs_write = !(valid_a || valid_b);
+    bool checkpoint_needs_write = false;
     if (valid_a || valid_b) {
         recovered = (!valid_b || (valid_a && state_a.generation >= state_b.generation)) ? state_a : state_b;
         checkpoint_needs_write = recovered.csv_size != actual_size;
+        g_persisted_checkpoint = recovered;
+        g_persisted_checkpoint_valid = true;
+        if (checkpoint_needs_write) recovered.flags &= ~CHECKPOINT_FLAG_INDEX_DISCONTINUITY;
         recovered_ok = recover_checkpoint_tail(&recovered, actual_size);
         ESP_LOGI(TAG, "Checkpoint seleccionado: generacion=%llu ultimo_id=%lu cola=%llu bytes",
                  (unsigned long long)recovered.generation, (unsigned long)recovered.last_id,
@@ -658,15 +815,23 @@ esp_err_t sd_store_init(void) {
         ESP_LOGE(TAG, "No se pudo determinar un ultimo ID seguro; SD no se habilita para evitar duplicados");
         return ESP_ERR_INVALID_STATE;
     }
-    g_checkpoint = recovered;
-    g_checkpoint_valid = valid_a || valid_b;
+    g_runtime_state = recovered;
     g_last_id = recovered.last_id;
-    if (checkpoint_needs_write) write_checkpoint_locked(&recovered);
+    g_checkpoint_pending = !g_persisted_checkpoint_valid ||
+                           g_persisted_checkpoint.csv_size != g_runtime_state.csv_size ||
+                           g_persisted_checkpoint.last_id != g_runtime_state.last_id;
+    if (checkpoint_needs_write && (recovered.flags & CHECKPOINT_FLAG_HISTORY_VERIFIED) != 0U) {
+        if (!write_checkpoint_locked(&recovered)) g_checkpoint_pending = true;
+    }
     g_index_ready = load_index();
+    g_index_state = g_index_ready ? INDEX_READY : INDEX_MISSING;
+    if (!g_index_ready && index_rebuild_blocked_for_runtime()) {
+        g_index_state = INDEX_INVALID_DISCONTINUITY;
+    }
     g_ready = true;
     if (!g_index_ready) start_index_rebuild();
     ESP_LOGI(TAG, "SD lista en %s, ultimo id=%lu checkpoint=%s indice=%s; sensores no esperan reconstruccion",
-             MOUNT_POINT, (unsigned long)g_last_id, g_checkpoint_valid ? "valido" : "pendiente",
+             MOUNT_POINT, (unsigned long)g_last_id, g_persisted_checkpoint_valid ? "valido" : "pendiente",
              g_index_ready ? "listo" : "reconstruyendo");
     return ESP_OK;
 }
@@ -679,11 +844,33 @@ uint32_t sd_store_last_id(void) {
     return g_last_id;
 }
 
-bool sd_store_checkpoint_valid(void) { return g_checkpoint_valid; }
-uint64_t sd_store_checkpoint_generation(void) { return g_checkpoint_valid ? g_checkpoint.generation : 0; }
+bool sd_store_checkpoint_valid(void) { return g_persisted_checkpoint_valid; }
+bool sd_store_checkpoint_current(void) {
+    return g_persisted_checkpoint_valid && !g_checkpoint_pending &&
+           g_persisted_checkpoint.last_id == g_runtime_state.last_id &&
+           g_persisted_checkpoint.row_count == g_runtime_state.row_count &&
+           g_persisted_checkpoint.csv_size == g_runtime_state.csv_size &&
+           g_persisted_checkpoint.confirmed_end_offset == g_runtime_state.confirmed_end_offset &&
+           g_persisted_checkpoint.last_row_crc == g_runtime_state.last_row_crc;
+}
+bool sd_store_checkpoint_pending(void) { return g_checkpoint_pending || !sd_store_checkpoint_current(); }
+uint64_t sd_store_checkpoint_generation(void) { return g_persisted_checkpoint_valid ? g_persisted_checkpoint.generation : 0; }
 bool sd_store_history_index_ready(void) { return g_index_ready; }
 bool sd_store_history_index_rebuilding(void) { return g_index_rebuilding; }
 uint32_t sd_store_history_index_points(void) { return g_index_count; }
+const char *sd_store_history_index_state(void) {
+    switch (g_index_state) {
+        case INDEX_MISSING: return "missing";
+        case INDEX_PENDING: return "pending";
+        case INDEX_REBUILDING: return "rebuilding";
+        case INDEX_READY: return "ready";
+        case INDEX_INVALID_DISCONTINUITY: return "invalid_discontinuity";
+        case INDEX_FAILED_MEMORY: return "failed_memory";
+        case INDEX_FAILED_IO: return "failed_io";
+        case INDEX_CANCELLED: return "cancelled";
+        default: return "unknown";
+    }
+}
 uint32_t sd_store_format_version(void) { return CSV_FORMAT_VERSION; }
 
 esp_err_t sd_store_clear(void) {
@@ -706,13 +893,14 @@ esp_err_t sd_store_clear(void) {
         if (g_lock) xSemaphoreGive(g_lock);
         return ESP_FAIL;
     }
-    if (fclose(f) != 0) {
+    if (!sync_file(f) || fclose(f) != 0) {
         ESP_LOGE(TAG, "Error cerrando CSV tras borrado: errno=%d (%s)", errno, strerror(errno));
         if (g_lock) xSemaphoreGive(g_lock);
         return ESP_FAIL;
     }
     g_rebuild_token++;
     g_index_rebuilding = false;
+    g_index_state = INDEX_CANCELLED;
     g_last_id = 0;
     g_index_count = 0;
     g_index_ready = false;
@@ -721,17 +909,23 @@ esp_err_t sd_store_clear(void) {
     unlink(INDEX_PATH);
     unlink(INDEX_TMP_PATH);
     unlink(INDEX_BAK_PATH);
+    unlink(INDEX_BLOCK_PATH);
     sd_checkpoint_t empty = {0};
     uint64_t empty_csv_size = 0;
     csv_size(&empty_csv_size);
     empty.csv_size = empty_csv_size;
     empty.confirmed_end_offset = empty_csv_size;
-    g_checkpoint_valid = false;
+    empty.flags = CHECKPOINT_FLAG_HISTORY_VERIFIED;
+    g_runtime_state = empty;
+    g_persisted_checkpoint_valid = false;
+    memset(&g_persisted_checkpoint, 0, sizeof(g_persisted_checkpoint));
+    g_checkpoint_pending = true;
     if (!write_checkpoint_locked(&empty) || !persist_index_locked()) {
         if (g_lock) xSemaphoreGive(g_lock);
         return ESP_FAIL;
     }
     g_index_ready = true;
+    g_index_state = INDEX_READY;
     if (g_lock) xSemaphoreGive(g_lock);
     ESP_LOGI(TAG, "Historial SD borrado correctamente; ultimo_id=0");
     return ESP_OK;
@@ -752,6 +946,11 @@ esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uin
     }
 
     if (g_lock) xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_last_id == UINT32_MAX) {
+        ESP_LOGE(TAG, "CRITICO: measurement_id alcanzo UINT32_MAX; no se escribira ni modificara el historial");
+        if (g_lock) xSemaphoreGive(g_lock);
+        return ESP_ERR_INVALID_SIZE;
+    }
     uint32_t id = g_last_id + 1U;
     ESP_LOGI(TAG,
              "Guardando medicion SD id=%lu boot_id=%lu uptime_s=%lu time_valid=%s timestamp=%s co2=%u pm2.5=%.2f voc=%.2f nox=%.2f temp=%.2f hum=%.2f scd=%.2f/%.2f sen=%.2f/%.2f gps=%s %.6f/%.6f window_s=%lu",
@@ -839,19 +1038,31 @@ esp_err_t sd_store_append_reading(const captive_manager_readings_t *reading, uin
 
     uint64_t row_end = (uint64_t)row_offset + (uint64_t)written;
     g_last_id = id;
-    if (sparse_point_id(id) && (!add_index_entry_ram(id, (uint64_t)row_offset) || !persist_index_locked())) {
+    g_runtime_state.last_id = id;
+    if (g_runtime_state.row_count == UINT64_MAX) {
+        ESP_LOGE(TAG, "CRITICO: contador logico de filas agotado despues de confirmar id=%lu", (unsigned long)id);
+        g_ready = false;
+        if (g_lock) xSemaphoreGive(g_lock);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    g_runtime_state.row_count++;
+    g_runtime_state.csv_size = row_end;
+    g_runtime_state.last_row_offset = (uint64_t)row_offset;
+    g_runtime_state.confirmed_end_offset = row_end;
+    g_runtime_state.last_row_crc = crc32_update(0, written_row, strlen(written_row));
+    if (sparse_point_id(id) && (!add_index_entry_ram(id, (uint64_t)row_offset) ||
+        (g_index_ready && !persist_index_locked()))) {
         g_index_ready = false;
+        g_index_state = INDEX_PENDING;
         ESP_LOGW(TAG, "Fila confirmada, pero indice pendiente de reconstruccion para id=%lu", (unsigned long)id);
     }
-    sd_checkpoint_t next = g_checkpoint;
-    next.last_id = id;
-    next.row_count = g_checkpoint.row_count + 1U;
-    next.csv_size = row_end;
-    next.last_row_offset = (uint64_t)row_offset;
-    next.confirmed_end_offset = row_end;
-    next.last_row_crc = crc32_update(0, written_row, strlen(written_row));
-    if (!write_checkpoint_locked(&next)) {
-        g_checkpoint = next;
+    if ((g_runtime_state.flags & CHECKPOINT_FLAG_HISTORY_VERIFIED) != 0U) {
+        if (!write_checkpoint_locked(&g_runtime_state)) {
+            g_checkpoint_pending = true;
+            ESP_LOGW(TAG, "Fila id=%lu confirmada en CSV; checkpoint persistido anterior se conserva y la cola se recuperara al reiniciar", (unsigned long)id);
+        }
+    } else {
+        g_checkpoint_pending = true;
         ESP_LOGW(TAG, "Fila id=%lu confirmada en CSV; checkpoint quedo atrasado y se recuperara al reiniciar", (unsigned long)id);
     }
 
@@ -1310,7 +1521,7 @@ esp_err_t sd_store_add_readings_since(cJSON *array, uint32_t after_id, uint32_t 
         return ESP_FAIL;
     }
 
-    long start_offset = get_id_offset(after_id + 1U);
+    long start_offset = after_id == UINT32_MAX ? -1 : get_id_offset(after_id + 1U);
     if (start_offset >= 0 && fseek(f, start_offset, SEEK_SET) != 0) rewind(f);
 
     char line[512];

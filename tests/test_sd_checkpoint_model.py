@@ -56,10 +56,11 @@ def valid_checkpoint(raw: bytes) -> tuple | None:
     return values if zlib.crc32(raw[:-4]) == values[-1] else None
 
 
-def recover_tail(path: Path, confirmed_end: int, last_id: int) -> tuple[int, int]:
+def recover_tail(path: Path, confirmed_end: int, last_id: int) -> tuple[int, int, str | None]:
     with path.open("r+b") as handle:
         handle.seek(confirmed_end)
         end = confirmed_end
+        expected_id = last_id + 1
         while True:
             offset = handle.tell()
             line = handle.readline()
@@ -67,13 +68,20 @@ def recover_tail(path: Path, confirmed_end: int, last_id: int) -> tuple[int, int
                 break
             if not line.endswith(b"\n"):
                 handle.truncate(end)
-                break
-            parsed = int(line.split(b",", 1)[0])
-            if parsed <= last_id:
-                break
+                return last_id, end, "incomplete"
+            try:
+                parsed = int(line.split(b",", 1)[0])
+            except ValueError:
+                handle.truncate(end)
+                return last_id, end, "invalid"
+            if parsed != expected_id:
+                handle.truncate(end)
+                cause = "duplicate_or_regression" if parsed < expected_id else "gap"
+                return last_id, end, cause
             last_id = parsed
+            expected_id += 1
             end = handle.tell()
-        return last_id, end
+        return last_id, end, None
 
 
 def build_sparse(path: Path) -> list[tuple[int, int]]:
@@ -119,8 +127,8 @@ class PersistenceModelTests(unittest.TestCase):
         temp, path, offsets = self.make_csv(1000)
         self.addCleanup(temp.cleanup)
         confirmed_end = offsets[900]
-        last_id, end = recover_tail(path, confirmed_end, 900)
-        self.assertEqual((last_id, end), (1000, path.stat().st_size))
+        last_id, end, error = recover_tail(path, confirmed_end, 900)
+        self.assertEqual((last_id, end, error), (1000, path.stat().st_size, None))
 
     def test_incomplete_last_row_is_truncated_without_reusing_complete_id(self):
         temp, path, offsets = self.make_csv(50)
@@ -128,10 +136,45 @@ class PersistenceModelTests(unittest.TestCase):
         confirmed = path.stat().st_size
         with path.open("ab") as handle:
             handle.write(b"51,1,51,1,gps,2026")
-        last_id, end = recover_tail(path, confirmed, 50)
+        last_id, end, error = recover_tail(path, confirmed, 50)
         self.assertEqual(last_id, 50)
         self.assertEqual(end, confirmed)
         self.assertEqual(path.stat().st_size, confirmed)
+        self.assertEqual(error, "incomplete")
+
+    def test_tail_gap_is_rejected_and_truncated_at_first_bad_row(self):
+        temp, path, offsets = self.make_csv(100)
+        self.addCleanup(temp.cleanup)
+        confirmed = path.stat().st_size
+        with path.open("ab") as handle:
+            handle.write(row(101))
+            valid_end = handle.tell()
+            handle.write(row(500))
+        last_id, end, error = recover_tail(path, confirmed, 100)
+        self.assertEqual((last_id, end, error), (101, valid_end, "gap"))
+        self.assertEqual(path.stat().st_size, valid_end)
+
+    def test_tail_duplicate_is_rejected(self):
+        temp, path, offsets = self.make_csv(100)
+        self.addCleanup(temp.cleanup)
+        confirmed = path.stat().st_size
+        with path.open("ab") as handle:
+            handle.write(row(101))
+            valid_end = handle.tell()
+            handle.write(row(101))
+        self.assertEqual(recover_tail(path, confirmed, 100), (101, valid_end, "duplicate_or_regression"))
+
+    def test_tail_regression_is_rejected(self):
+        temp, path, offsets = self.make_csv(100)
+        self.addCleanup(temp.cleanup)
+        confirmed = path.stat().st_size
+        with path.open("ab") as handle:
+            handle.write(row(99))
+        self.assertEqual(recover_tail(path, confirmed, 100), (100, confirmed, "duplicate_or_regression"))
+
+    def test_uint32_max_does_not_wrap(self):
+        last_id = (1 << 32) - 1
+        self.assertIsNone(None if last_id == (1 << 32) - 1 else last_id + 1)
 
     def test_sparse_index_points_and_range_seek(self):
         temp, path, offsets = self.make_csv(1000)
