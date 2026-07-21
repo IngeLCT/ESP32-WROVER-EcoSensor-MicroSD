@@ -843,12 +843,9 @@ static esp_err_t status_get(httpd_req_t *r) {
     cJSON_AddNumberToObject(root, "sd_last_id", sd_store_last_id());
     cJSON_AddBoolToObject(root, "checkpoint_valid", sd_store_checkpoint_valid());
     cJSON_AddBoolToObject(root, "checkpoint_current", sd_store_checkpoint_current());
-    cJSON_AddBoolToObject(root, "checkpoint_pending", sd_store_checkpoint_pending());
     cJSON_AddNumberToObject(root, "checkpoint_generation", (double)sd_store_checkpoint_generation());
     cJSON_AddBoolToObject(root, "history_index_ready", sd_store_history_index_ready());
-    cJSON_AddBoolToObject(root, "history_index_rebuilding", sd_store_history_index_rebuilding());
     cJSON_AddNumberToObject(root, "history_index_points", sd_store_history_index_points());
-    cJSON_AddStringToObject(root, "history_index_state", sd_store_history_index_state());
     cJSON_AddNumberToObject(root, "sd_format_version", sd_store_format_version());
     cJSON_AddNumberToObject(root, "boot_id", g_boot_id);
     cJSON_AddNumberToObject(root, "current_uptime_s", (double)(esp_timer_get_time() / 1000000ULL));
@@ -874,10 +871,6 @@ static esp_err_t status_get(httpd_req_t *r) {
         cJSON_AddStringToObject(root, "current_datetime", current_datetime);
     } else {
         cJSON_AddNullToObject(root, "current_datetime");
-        if (g_config_date[0] && g_config_time[0]) {
-            cJSON_AddStringToObject(root, "last_saved_date", g_config_date);
-            cJSON_AddStringToObject(root, "last_saved_time", g_config_time);
-        }
     }
     cJSON_AddStringToObject(root, "sensors", g_sensors_started ? "running" : "waiting");
     uint32_t last_measurement_id = g_last_readings.measurement_id;
@@ -893,14 +886,6 @@ static esp_err_t status_get(httpd_req_t *r) {
         cJSON_AddNullToObject(root, "last_measurement_timestamp");
     }
     cJSON_AddBoolToObject(root, "last_measurement_time_valid", g_last_readings.time_valid);
-    cJSON_AddStringToObject(root, "last_measurement_time_source",
-                            g_last_readings.time_source[0] ? g_last_readings.time_source : "none");
-    time_t last_measurement_epoch = 0;
-    if (g_last_readings.time_valid && parse_utc_timestamp(g_last_readings.timestamp, &last_measurement_epoch)) {
-        cJSON_AddNumberToObject(root, "last_measurement_epoch", (double)last_measurement_epoch);
-    } else {
-        cJSON_AddNullToObject(root, "last_measurement_epoch");
-    }
     cJSON_AddBoolToObject(root, "gps_valid", g_last_readings.gps_valid);
     if (g_last_readings.gps_valid) {
         cJSON_AddNumberToObject(root, "gps_lat", g_last_readings.gps_lat);
@@ -915,12 +900,7 @@ static esp_err_t status_get(httpd_req_t *r) {
         cJSON_AddNumberToObject(root, "gps_hdop", 0);
         cJSON_AddNumberToObject(root, "gps_age_ms", 0);
     }
-    cJSON_AddStringToObject(root, "state", captive_manager_state_str(g_state));
-    cJSON_AddBoolToObject(root, "using_saved", g_using_saved);
-    cJSON_AddBoolToObject(root, "saved_apsta_mode", g_saved_apsta_mode);
-    cJSON_AddBoolToObject(root, "can_measure", captive_manager_can_measure());
     cJSON_AddBoolToObject(root, "can_push", captive_manager_can_push_measurements());
-    cJSON_AddNumberToObject(root, "conn_attempts", g_connect_attempts);
     char *out = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(r, "application/json");
     httpd_resp_sendstr(r, out);
