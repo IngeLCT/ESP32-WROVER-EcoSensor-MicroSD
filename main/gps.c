@@ -21,6 +21,19 @@
 #define GPS_TASK_STACK         4096
 #define GPS_UART_BUF_SIZE      1024
 #define GPS_LINE_MAX           128
+#define GPS_SILENCE_STAGE_MS   60000
+#define GPS_STANDBY_MS         1000
+
+typedef enum {
+    GPS_STATE_STARTING = 0,
+    GPS_STATE_WAITING_DATA,
+    GPS_STATE_UART_RECONFIG,
+    GPS_STATE_WAKEUP_CYCLE,
+    GPS_STATE_NMEA_WITHOUT_FIX,
+    GPS_STATE_FIX_VALID,
+    GPS_STATE_RESTART_PENDING,
+    GPS_STATE_UART_SILENT,
+} gps_state_internal_t;
 
 static const char *TAG = "GPS";
 
@@ -31,6 +44,41 @@ static TickType_t s_last_fix_tick = 0;
 static bool s_started = false;
 static gps_time_callback_t s_time_callback = NULL;
 static time_t s_last_reported_epoch = 0;
+static volatile gps_state_internal_t s_state = GPS_STATE_STARTING;
+static volatile uint32_t s_chars_received = 0;
+static volatile TickType_t s_last_rx_tick = 0;
+static volatile uint32_t s_recovery_count = 0;
+static volatile bool s_restart_requested = false;
+
+static const char *gps_state_str(gps_state_internal_t state) {
+    switch (state) {
+        case GPS_STATE_STARTING: return "starting";
+        case GPS_STATE_WAITING_DATA: return "waiting_data";
+        case GPS_STATE_UART_RECONFIG: return "uart_reconfig";
+        case GPS_STATE_WAKEUP_CYCLE: return "wakeup_cycle";
+        case GPS_STATE_NMEA_WITHOUT_FIX: return "nmea_without_fix";
+        case GPS_STATE_FIX_VALID: return "fix_valid";
+        case GPS_STATE_RESTART_PENDING: return "restart_pending";
+        case GPS_STATE_UART_SILENT: return "uart_silent";
+        default: return "unknown";
+    }
+}
+
+static esp_err_t configure_uart(void) {
+    uart_config_t uart_config = {
+        .baud_rate = GPS_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    esp_err_t err = uart_param_config(GPS_UART_PORT, &uart_config);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return uart_set_pin(GPS_UART_PORT, GPS_TX_PIN, GPS_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+}
 
 static bool starts_with(const char *text, const char *prefix) {
     return text && prefix && strncmp(text, prefix, strlen(prefix)) == 0;
@@ -125,6 +173,7 @@ static void store_fix(double lat, double lon, uint8_t satellites, float hdop) {
     s_last_fix.hdop = hdop > 0.0f ? hdop : previous_hdop;
     s_last_fix.age_ms = 0;
     s_last_fix_tick = xTaskGetTickCount();
+    s_state = GPS_STATE_FIX_VALID;
     if (s_gps_lock) {
         xSemaphoreGive(s_gps_lock);
     }
@@ -235,6 +284,8 @@ static void gps_task(void *pv) {
     size_t pos = 0;
     uint32_t chars_seen = 0;
     TickType_t last_diag = xTaskGetTickCount();
+    TickType_t silence_deadline = last_diag + pdMS_TO_TICKS(GPS_SILENCE_STAGE_MS);
+    unsigned silence_stage = 0;
     bool first_fix_logged = false;
 
     ESP_LOGI(TAG, "Tarea GPS iniciada en UART%d RX=%d TX=%d baud=%d", GPS_UART_PORT, GPS_RX_PIN, GPS_TX_PIN, GPS_BAUD_RATE);
@@ -243,6 +294,13 @@ static void gps_task(void *pv) {
         int len = uart_read_bytes(GPS_UART_PORT, &byte, 1, pdMS_TO_TICKS(1000));
         if (len > 0) {
             chars_seen++;
+            s_chars_received = chars_seen;
+            s_last_rx_tick = xTaskGetTickCount();
+            s_restart_requested = false;
+            silence_stage = 0;
+            if (s_state != GPS_STATE_FIX_VALID) {
+                s_state = GPS_STATE_NMEA_WITHOUT_FIX;
+            }
             if (byte == '\n') {
                 line[pos] = '\0';
                 if (pos > 0) {
@@ -265,6 +323,40 @@ static void gps_task(void *pv) {
         }
 
         TickType_t now = xTaskGetTickCount();
+        if (chars_seen == 0 && (int32_t)(now - silence_deadline) >= 0) {
+            if (silence_stage == 0) {
+                s_state = GPS_STATE_UART_RECONFIG;
+                s_recovery_count++;
+                ESP_LOGW(TAG, "GPS sin datos durante %d ms; reaplicando UART%d y limpiando RX",
+                         GPS_SILENCE_STAGE_MS, GPS_UART_PORT);
+                esp_err_t err = configure_uart();
+                if (err == ESP_OK) {
+                    err = uart_flush_input(GPS_UART_PORT);
+                }
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Fallo al recuperar UART GPS: %s", esp_err_to_name(err));
+                }
+                s_state = GPS_STATE_WAITING_DATA;
+                silence_stage = 1;
+            } else if (silence_stage == 1) {
+                s_state = GPS_STATE_WAKEUP_CYCLE;
+                s_recovery_count++;
+                ESP_LOGW(TAG, "GPS sigue sin datos; L76K a standby por GPIO%d LOW y regreso a operacion HIGH",
+                         GPS_WAKEUP_PIN);
+                gpio_set_level(GPS_WAKEUP_PIN, 0);
+                vTaskDelay(pdMS_TO_TICKS(GPS_STANDBY_MS));
+                gpio_set_level(GPS_WAKEUP_PIN, 1);
+                uart_flush_input(GPS_UART_PORT);
+                s_state = GPS_STATE_WAITING_DATA;
+                silence_stage = 2;
+            } else {
+                s_state = GPS_STATE_RESTART_PENDING;
+                s_restart_requested = true;
+                ESP_LOGE(TAG, "GPS continua sin enviar datos tras recuperar UART y WAKEUP; se solicita reinicio controlado");
+                silence_stage = 3;
+            }
+            silence_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(GPS_SILENCE_STAGE_MS);
+        }
         if ((now - last_diag) >= pdMS_TO_TICKS(30000)) {
             if (!first_fix_logged) {
                 ESP_LOGW(TAG, "Esperando fix GPS valido; caracteres NMEA recibidos=%lu", (unsigned long)chars_seen);
@@ -293,23 +385,33 @@ esp_err_t gps_init(void) {
         .intr_type = GPIO_INTR_DISABLE,
     };
     esp_err_t err = gpio_config(&wake_cfg);
-    if (err == ESP_OK) {
-        gpio_set_level(GPS_WAKEUP_PIN, 1);
-    } else {
-        ESP_LOGW(TAG, "No se pudo configurar GPS_WAKEUP GPIO%d: %s", GPS_WAKEUP_PIN, esp_err_to_name(err));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "No se pudo configurar GPS_WAKEUP GPIO%d: %s", GPS_WAKEUP_PIN, esp_err_to_name(err));
+        return err;
+    }
+    err = gpio_set_level(GPS_WAKEUP_PIN, 1);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "No se pudo activar GPS_WAKEUP GPIO%d HIGH: %s", GPS_WAKEUP_PIN, esp_err_to_name(err));
+        return err;
     }
 
-    uart_config_t uart_config = {
-        .baud_rate = GPS_BAUD_RATE,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-    ESP_RETURN_ON_ERROR(uart_driver_install(GPS_UART_PORT, GPS_UART_BUF_SIZE, 0, 0, NULL, 0), TAG, "uart_driver_install GPS");
-    ESP_RETURN_ON_ERROR(uart_param_config(GPS_UART_PORT, &uart_config), TAG, "uart_param_config GPS");
-    ESP_RETURN_ON_ERROR(uart_set_pin(GPS_UART_PORT, GPS_TX_PIN, GPS_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE), TAG, "uart_set_pin GPS");
+    err = uart_driver_install(GPS_UART_PORT, GPS_UART_BUF_SIZE, 0, 0, NULL, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "uart_driver_install GPS fallo: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = configure_uart();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Configuracion UART GPS fallo: %s", esp_err_to_name(err));
+        uart_driver_delete(GPS_UART_PORT);
+        return err;
+    }
+    err = uart_flush_input(GPS_UART_PORT);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Limpieza inicial UART GPS fallo: %s", esp_err_to_name(err));
+        uart_driver_delete(GPS_UART_PORT);
+        return err;
+    }
 
     BaseType_t ok = xTaskCreate(gps_task, "gps_task", GPS_TASK_STACK, NULL, tskIDLE_PRIORITY + 2, &s_gps_task_handle);
     if (ok != pdPASS) {
@@ -317,8 +419,34 @@ esp_err_t gps_init(void) {
         return ESP_ERR_NO_MEM;
     }
     s_started = true;
+    s_state = GPS_STATE_WAITING_DATA;
+    s_chars_received = 0;
+    s_last_rx_tick = 0;
+    s_recovery_count = 0;
+    s_restart_requested = false;
     ESP_LOGI(TAG, "GPS inicializado; se esperara primer fix valido antes de medir");
     return ESP_OK;
+}
+
+esp_err_t gps_get_status(gps_status_t *out) {
+    if (!out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    TickType_t now = xTaskGetTickCount();
+    TickType_t last_rx = s_last_rx_tick;
+    out->state = gps_state_str(s_state);
+    out->chars_received = s_chars_received;
+    out->last_rx_age_ms = last_rx == 0
+        ? (uint32_t)(now * portTICK_PERIOD_MS)
+        : (uint32_t)((now - last_rx) * portTICK_PERIOD_MS);
+    out->recovery_count = s_recovery_count;
+    out->restart_requested = s_restart_requested;
+    return ESP_OK;
+}
+
+void gps_mark_restart_limited(void) {
+    s_restart_requested = false;
+    s_state = GPS_STATE_UART_SILENT;
 }
 
 bool gps_has_valid_fix(void) {

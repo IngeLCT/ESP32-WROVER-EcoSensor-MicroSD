@@ -51,6 +51,10 @@ static int  g_connect_attempts = 0;
 static int64_t g_boot_time_ms = 0;
 static captive_manager_readings_t g_last_readings = {0};
 static bool g_sntp_started = false;
+static char g_gps_state[24] = "starting";
+static uint32_t g_gps_chars_received = 0;
+static uint32_t g_gps_last_rx_age_ms = 0;
+static uint32_t g_gps_recovery_count = 0;
 
 #define MIN_VALID_EPOCH 1704067200LL /* 2024-01-01T00:00:00Z */
 #define TIME_ADJUST_THRESHOLD_SECONDS 10
@@ -146,6 +150,16 @@ void captive_manager_set_last_readings(const captive_manager_readings_t *reading
         return;
     }
     g_last_readings = *readings;
+}
+
+void captive_manager_set_gps_status(const char *state,
+                                    uint32_t chars_received,
+                                    uint32_t last_rx_age_ms,
+                                    uint32_t recovery_count) {
+    snprintf(g_gps_state, sizeof(g_gps_state), "%s", state && state[0] ? state : "unknown");
+    g_gps_chars_received = chars_received;
+    g_gps_last_rx_age_ms = last_rx_age_ms;
+    g_gps_recovery_count = recovery_count;
 }
 
 
@@ -886,6 +900,10 @@ static esp_err_t status_get(httpd_req_t *r) {
         cJSON_AddNullToObject(root, "last_measurement_timestamp");
     }
     cJSON_AddBoolToObject(root, "last_measurement_time_valid", g_last_readings.time_valid);
+    cJSON_AddStringToObject(root, "gps_state", g_gps_state);
+    cJSON_AddNumberToObject(root, "gps_chars_received", g_gps_chars_received);
+    cJSON_AddNumberToObject(root, "gps_last_rx_age_ms", g_gps_last_rx_age_ms);
+    cJSON_AddNumberToObject(root, "gps_recovery_count", g_gps_recovery_count);
     cJSON_AddBoolToObject(root, "gps_valid", g_last_readings.gps_valid);
     if (g_last_readings.gps_valid) {
         cJSON_AddNumberToObject(root, "gps_lat", g_last_readings.gps_lat);

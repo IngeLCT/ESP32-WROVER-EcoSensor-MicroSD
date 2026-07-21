@@ -1,9 +1,11 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include "driver/gpio.h"
 #include "esp_event.h"
+#include "esp_attr.h"
 #include "esp_http_client.h"
 #include "esp_timer.h"
 #include "esp_log.h"
@@ -37,6 +39,9 @@ const float ECO_SEN55_TEMP_OFFSET_C = -3.02f;
 #define SAMPLES_PER_AVG_WINDOW   10
 #define SEN51_VOC_NOX_WARMUP_MS  120000
 #define BOARD_POWERON_PIN        GPIO_NUM_12
+#define GPS_INIT_MAX_RESTARTS    2
+#define GPS_SILENT_MAX_RESTARTS  1
+#define GPS_RESTART_DELAY_MS     3000
 
 #define MEASUREMENT_PUSH_ENDPOINT      "http://ecosensor.local:8765/api/measurements/push"
 #define MEASUREMENT_PUSH_PORT          8765
@@ -62,6 +67,27 @@ static TaskHandle_t s_sensor_task_handle = NULL;
 static TaskHandle_t s_push_task_handle = NULL;
 static QueueHandle_t s_measurement_push_queue = NULL;
 static bool s_sensors_started = false;
+RTC_DATA_ATTR static uint32_t s_gps_init_restart_count = 0;
+RTC_DATA_ATTR static uint32_t s_gps_silent_restart_count = 0;
+
+static void publish_gps_status(const char *override_state) {
+    if (override_state && strcmp(override_state, "init_failed") == 0) {
+        captive_manager_set_gps_status("init_failed", 0, 0, s_gps_init_restart_count);
+        return;
+    }
+    gps_status_t status = {0};
+    if (gps_get_status(&status) == ESP_OK) {
+        captive_manager_set_gps_status(override_state ? override_state : status.state,
+                                       status.chars_received,
+                                       status.last_rx_age_ms,
+                                       status.recovery_count + s_gps_silent_restart_count);
+    } else {
+        captive_manager_set_gps_status(override_state ? override_state : "init_failed",
+                                       0,
+                                       0,
+                                       s_gps_init_restart_count);
+    }
+}
 
 static void gps_time_available(time_t epoch_utc) {
     esp_err_t err = captive_manager_offer_time_epoch(epoch_utc, "gps");
@@ -504,7 +530,19 @@ void app_main(void)
     enable_board_peripherals_power();
     esp_err_t gps_ret = gps_init();
     if (gps_ret != ESP_OK) {
-        ESP_LOGE(TAG, "No se pudo inicializar GPS; sensores quedaran esperando fix: %s", esp_err_to_name(gps_ret));
+        s_gps_init_restart_count++;
+        ESP_LOGE(TAG, "gps_init fallo (%lu/%d): %s",
+                 (unsigned long)s_gps_init_restart_count,
+                 GPS_INIT_MAX_RESTARTS,
+                 esp_err_to_name(gps_ret));
+        if (s_gps_init_restart_count <= GPS_INIT_MAX_RESTARTS) {
+            ESP_LOGE(TAG, "EcoSensor se reiniciara en %d ms para recuperar GPS", GPS_RESTART_DELAY_MS);
+            vTaskDelay(pdMS_TO_TICKS(GPS_RESTART_DELAY_MS));
+            esp_restart();
+        }
+        ESP_LOGE(TAG, "Limite de reinicios por gps_init alcanzado; WiFi y /status permaneceran disponibles");
+    } else {
+        s_gps_init_restart_count = 0;
     }
 
     captive_manager_cfg_t cfg = {
@@ -518,6 +556,7 @@ void app_main(void)
     };
 
     ESP_ERROR_CHECK(captive_manager_init(&cfg));
+    publish_gps_status(gps_ret == ESP_OK ? NULL : "init_failed");
     gps_set_time_callback(gps_time_available);
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &wifi_event_handler, NULL));
@@ -559,6 +598,30 @@ void app_main(void)
                 NULL);
 
     while (1) {
+        gps_status_t gps_status = {0};
+        if (gps_ret == ESP_OK && gps_get_status(&gps_status) == ESP_OK) {
+            if (gps_status.chars_received > 0) {
+                s_gps_silent_restart_count = 0;
+            }
+            if (gps_status.restart_requested) {
+                if (s_gps_silent_restart_count < GPS_SILENT_MAX_RESTARTS) {
+                    s_gps_silent_restart_count++;
+                    publish_gps_status("restart_pending");
+                    ESP_LOGE(TAG, "GPS sin datos; reinicio controlado %lu/%d en %d ms",
+                             (unsigned long)s_gps_silent_restart_count,
+                             GPS_SILENT_MAX_RESTARTS,
+                             GPS_RESTART_DELAY_MS);
+                    vTaskDelay(pdMS_TO_TICKS(GPS_RESTART_DELAY_MS));
+                    esp_restart();
+                } else {
+                    ESP_LOGE(TAG, "GPS sigue sin datos y ya se uso el reinicio permitido; se conserva acceso a /status");
+                    gps_mark_restart_limited();
+                }
+            }
+            publish_gps_status(NULL);
+        } else {
+            publish_gps_status("init_failed");
+        }
         ESP_LOGI(TAG, "Estado captive_manager: %s | time_valid=%s | sensores=%s",
                  captive_manager_state_str(captive_manager_get_state()),
                  captive_manager_time_is_valid() ? "true" : "false",

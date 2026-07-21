@@ -75,6 +75,10 @@ esp_err_t captive_manager_enter_recaptive(void);
 bool captive_manager_using_saved(void);
 void captive_manager_set_sensors_started(bool started);
 void captive_manager_set_last_readings(const captive_manager_readings_t *readings);
+void captive_manager_set_gps_status(const char *state,
+                                    uint32_t chars_received,
+                                    uint32_t last_rx_age_ms,
+                                    uint32_t recovery_count);
 bool captive_manager_time_is_valid(void);
 const char *captive_manager_time_source(void);
 time_t captive_manager_current_epoch(void);

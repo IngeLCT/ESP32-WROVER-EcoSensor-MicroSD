@@ -19,12 +19,22 @@ typedef struct {
     uint32_t age_ms;
 } gps_fix_t;
 
+typedef struct {
+    const char *state;
+    uint32_t chars_received;
+    uint32_t last_rx_age_ms;
+    uint32_t recovery_count;
+    bool restart_requested;
+} gps_status_t;
+
 typedef void (*gps_time_callback_t)(time_t epoch_utc);
 
 esp_err_t gps_init(void);
 bool gps_has_valid_fix(void);
 esp_err_t gps_wait_for_valid(uint32_t timeout_ms);
 esp_err_t gps_get_fix(gps_fix_t *out, uint32_t max_age_ms, uint32_t timeout_ms);
+esp_err_t gps_get_status(gps_status_t *out);
+void gps_mark_restart_limited(void);
 void gps_set_time_callback(gps_time_callback_t callback);
 
 #ifdef __cplusplus
