@@ -22,11 +22,11 @@
 #define SCD40_CO2_SPEC_MIN      400
 #define SCD40_CO2_SPEC_MAX      2000
 
-// Calibración temporal de prueba: aplicar en cada arranque sin persistir EEPROM.
-// ecosensor03 aplica 10.70 C al arrancar y luego lee/reporta el offset actual del SCD40.
+// Aplicar en cada arranque el offset predeterminado del SCD40 sin persistir EEPROM.
+// Esto reemplaza cualquier offset temporal que siga activo después de una OTA.
 #define SCD40_APPLY_TEMP_OFFSET_ON_BOOT  1
 
-// Compensación temporal de prueba SEN55: offset simple, sin persistir.
+// Aplicar en cada arranque la compensación calibrada del SEN55, sin persistir.
 // Sensirion SEN5x usa escala offset_raw = offset_c * 200.
 #define SEN55_APPLY_TEMP_OFFSET_ON_BOOT  1
 #define SEN55_BOOT_TEMP_OFFSET_SLOPE     0

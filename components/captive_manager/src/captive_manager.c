@@ -1238,13 +1238,13 @@ static esp_err_t tabla_get(httpd_req_t *r) {
     } else {
         httpd_resp_send_chunk(r,
             "<table><tr><th>Mediciones</th><th>Valor</th><th>Unidad</th></tr>", -1);
-        snprintf(buf, sizeof(buf), "<tr><td>CO2</td><td>%u</td><td>ppm</td></tr>", g_last_readings.co2); httpd_resp_send_chunk(r, buf, -1);
         snprintf(buf, sizeof(buf), "<tr><td>PM 1.0</td><td>%.2f</td><td>ug/m3</td></tr>", g_last_readings.pm1p0); httpd_resp_send_chunk(r, buf, -1);
         snprintf(buf, sizeof(buf), "<tr><td>PM 2.5</td><td>%.2f</td><td>ug/m3</td></tr>", g_last_readings.pm2p5); httpd_resp_send_chunk(r, buf, -1);
         snprintf(buf, sizeof(buf), "<tr><td>PM 4.0</td><td>%.2f</td><td>ug/m3</td></tr>", g_last_readings.pm4p0); httpd_resp_send_chunk(r, buf, -1);
         snprintf(buf, sizeof(buf), "<tr><td>PM 10</td><td>%.2f</td><td>ug/m3</td></tr>", g_last_readings.pm10p0); httpd_resp_send_chunk(r, buf, -1);
         snprintf(buf, sizeof(buf), "<tr><td>VOC</td><td>%.2f</td><td>indice</td></tr>", g_last_readings.voc); httpd_resp_send_chunk(r, buf, -1);
         snprintf(buf, sizeof(buf), "<tr><td>NOx</td><td>%.2f</td><td>indice</td></tr>", g_last_readings.nox); httpd_resp_send_chunk(r, buf, -1);
+        snprintf(buf, sizeof(buf), "<tr><td>CO2</td><td>%u</td><td>ppm</td></tr>", g_last_readings.co2); httpd_resp_send_chunk(r, buf, -1);
         snprintf(buf, sizeof(buf), "<tr><td>Temperatura</td><td>%.2f</td><td>&deg;C</td></tr>", g_last_readings.temp); httpd_resp_send_chunk(r, buf, -1);
         snprintf(buf, sizeof(buf), "<tr><td>Humedad</td><td>%.2f</td><td>%%</td></tr>", g_last_readings.hum); httpd_resp_send_chunk(r, buf, -1);
         httpd_resp_send_chunk(r, "</table>", -1);
