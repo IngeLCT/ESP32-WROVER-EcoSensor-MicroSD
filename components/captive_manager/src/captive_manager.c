@@ -47,6 +47,7 @@ static char g_config_date[11] = {0};
 static char g_config_time[9] = {0};
 static char g_last_sync_source[16] = "none";
 static char g_push_host[64] = {0};
+static uint16_t g_push_port = 80;
 static int  g_connect_attempts = 0;
 static int64_t g_boot_time_ms = 0;
 static captive_manager_readings_t g_last_readings = {0};
@@ -244,6 +245,10 @@ bool captive_manager_can_push_measurements(void) {
 
 const char *captive_manager_push_host(void) {
     return g_push_host;
+}
+
+uint16_t captive_manager_push_port(void) {
+    return g_push_port;
 }
 
 uint32_t captive_manager_boot_id(void) {
@@ -877,6 +882,7 @@ static esp_err_t status_get(httpd_req_t *r) {
     } else {
         cJSON_AddNullToObject(root, "push_host");
     }
+    cJSON_AddNumberToObject(root, "push_port", g_push_port);
     if (g_time_valid) {
         char current_datetime[32];
         get_current_datetime_string(current_datetime, sizeof(current_datetime));
@@ -1555,8 +1561,20 @@ static esp_err_t config_post(httpd_req_t *r) {
     if (cJSON_IsString(j_push_host) && j_push_host->valuestring &&
         strlen(j_push_host->valuestring) < sizeof(g_push_host)) {
         snprintf(g_push_host, sizeof(g_push_host), "%s", j_push_host->valuestring);
-        ESP_LOGI(TAG, "Push host configurado por servidor: %s", g_push_host);
     }
+    cJSON *j_push_port = cJSON_GetObjectItem(root, "push_port");
+    if (!cJSON_IsNumber(j_push_port)) {
+        j_push_port = cJSON_GetObjectItem(root, "server_port");
+    }
+    if (cJSON_IsNumber(j_push_port) &&
+        j_push_port->valuedouble >= 1.0 &&
+        j_push_port->valuedouble <= 65535.0 &&
+        j_push_port->valuedouble == (double)(uint16_t)j_push_port->valuedouble) {
+        g_push_port = (uint16_t)j_push_port->valuedouble;
+    }
+    ESP_LOGI(TAG, "Destino push configurado en RAM: %s:%u",
+             g_push_host[0] ? g_push_host : "ecosensor.local",
+             (unsigned)g_push_port);
 
     esp_err_t err = ESP_OK;
     cJSON *j_epoch = cJSON_GetObjectItem(root, "epoch");

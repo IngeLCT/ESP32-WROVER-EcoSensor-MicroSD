@@ -86,6 +86,7 @@ esp_err_t captive_manager_offer_time_epoch(time_t epoch_utc, const char *source)
 bool captive_manager_can_measure(void);
 bool captive_manager_can_push_measurements(void);
 const char *captive_manager_push_host(void);
+uint16_t captive_manager_push_port(void);
 uint32_t captive_manager_boot_id(void);
 
 #ifdef __cplusplus

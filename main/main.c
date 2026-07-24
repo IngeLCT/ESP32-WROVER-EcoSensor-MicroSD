@@ -43,8 +43,8 @@ const float ECO_SEN55_TEMP_OFFSET_C = -3.02f;
 #define GPS_SILENT_MAX_RESTARTS  1
 #define GPS_RESTART_DELAY_MS     3000
 
-#define MEASUREMENT_PUSH_ENDPOINT      "http://ecosensor.local:8765/api/measurements/push"
-#define MEASUREMENT_PUSH_PORT          8765
+#define MEASUREMENT_PUSH_DEFAULT_HOST  "ecosensor.local"
+#define MEASUREMENT_PUSH_DEFAULT_PORT  80
 #define MEASUREMENT_PUSH_PATH          "/api/measurements/push"
 #define MEASUREMENT_PUSH_TIMEOUT_MS    3000
 #define MEASUREMENT_PUSH_TASK_STACK    7168
@@ -148,17 +148,21 @@ static esp_err_t post_measurement_payload(const captive_manager_readings_t *read
     }
 
     char dynamic_push_url[160];
-    const char *push_host = captive_manager_push_host();
-    const char *push_url = MEASUREMENT_PUSH_ENDPOINT;
-    if (push_host && push_host[0]) {
-        snprintf(dynamic_push_url,
-                 sizeof(dynamic_push_url),
-                 "http://%s:%d%s",
-                 push_host,
-                 MEASUREMENT_PUSH_PORT,
-                 MEASUREMENT_PUSH_PATH);
-        push_url = dynamic_push_url;
+    const char *configured_push_host = captive_manager_push_host();
+    const char *push_host = (configured_push_host && configured_push_host[0])
+        ? configured_push_host
+        : MEASUREMENT_PUSH_DEFAULT_HOST;
+    uint16_t push_port = captive_manager_push_port();
+    if (push_port == 0) {
+        push_port = MEASUREMENT_PUSH_DEFAULT_PORT;
     }
+    snprintf(dynamic_push_url,
+             sizeof(dynamic_push_url),
+             "http://%s:%u%s",
+             push_host,
+             (unsigned)push_port,
+             MEASUREMENT_PUSH_PATH);
+    const char *push_url = dynamic_push_url;
 
     esp_http_client_config_t config = {
         .url = push_url,
